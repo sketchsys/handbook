@@ -18,7 +18,7 @@ Each topic answers:
 
 ## Topics
 
-1. **Fundamentals** — reliability, scalability, maintainability; back-of-envelope estimation; latency numbers
+1. [**Fundamentals**](./01-fundamentals/) — reliability, scalability, maintainability; back-of-envelope estimation; latency numbers
 2. **Networking & traffic routing** — DNS, load balancers (L4 vs L7), CDN, API gateway, reverse proxy, TLS
 3. **Data** — SQL vs NoSQL, replication, sharding, indexing, transactions
 4. **Communication** — REST vs RPC vs GraphQL, message queues, pub/sub, streaming
