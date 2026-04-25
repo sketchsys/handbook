@@ -83,17 +83,7 @@ The three-axis framework raises three questions that recur often enough to deser
 
 ### 1. Why does each "9" of availability cost ~10× more?
 
-Availability targets translate to allowed downtime per year:
-
-| Availability | Allowed downtime / year | Allowed downtime / day |
-|---|---|---|
-| 99% | 3.65 days | ~14.4 min |
-| 99.9% | 8.76 hours | ~1.44 min |
-| 99.99% | 52.6 min | ~8.6 sec |
-| 99.999% | 5.26 min | ~0.86 sec |
-| 99.9999% | 31.5 sec | ~86 ms |
-
-Each row cuts allowed downtime by 10×. Google's SRE book formalizes this as a rule of thumb: *"An extra nine of availability costs roughly 10× more to achieve."*
+Each additional nine of availability cuts allowed downtime by 10× — full table in [availability-math.md](./availability-math.md#the-9s--availability-vs-allowed-downtime). Google's SRE book formalizes this as a rule of thumb: *"An extra nine of availability costs roughly 10× more to achieve."*
 
 The 10× multiplier is not one reason but five stacking ones:
 
@@ -147,9 +137,215 @@ Kleppmann's three + security + cost ≈ AWS Well-Architected's five core pillars
 
 ---
 
+## 2. Reliability — deep dive
+
+§1 defined reliability as *"the system does the right thing, even when things go wrong."* That sentence quietly contains the most important distinction in the chapter — *a thing going wrong is not the same as the system failing.* The job of reliability engineering is to put daylight between those two events.
+
+### Fault vs failure
+
+- **Fault** — a component (a disk, a process, a network link, a deployment, an operator's hand on the keyboard) deviates from its specification. Faults are *local*. A disk had a bit flip. A node lost power. A service returned a 500. A junior engineer truncated the wrong table.
+- **Failure** — the system as a whole stops providing the service its users expect. Failures are *global*, user-visible.
+
+A fault-tolerant system is one in which **faults happen but failures don't** — or do so rarely enough. The whole engineering project of reliability is converting *"1 fault → 1 failure"* into *"1 fault → 0 failure."*
+
+You cannot prevent faults. Hardware degrades, networks partition, processes get OOM-killed, deployments ship bugs, humans mistype. Integrated over a long enough time and a large enough fleet, the probability of *some* fault is 1. What you can do is design so that no single fault — and ideally no realistic combination of faults — translates into a failure.
+
+> Reliability engineering is not about making faults stop happening. It is about making faults **not matter**.
+
+This reframing matters because the two intuitions lead to opposite designs. *"Make faults not happen"* → expensive single-vendor enterprise hardware, long change-freezes, gatekeeping reviews, a *"don't touch it, it'll break"* culture. *"Make faults not matter"* → commodity hardware, redundancy, fast deploys, automated recovery, chaos engineering. The cloud-native industry won the second argument; Google's SRE book, Amazon's *"everything fails all the time"* doctrine, and Netflix's chaos engineering all rest on it.
+
+#### Same fault, three architectures
+
+Take a single fault: **the database primary loses power.**
+
+- **System A** — single Postgres on a single VM. No replica, no failover script. The database is unreachable, every dependent request errors out. **1 fault → 1 failure.**
+- **System B** — Postgres primary + warm standby + manual failover. An alert fires; on-call logs in, promotes the standby, updates DNS or connection strings. ~20 minutes of degraded service. **1 fault → 1 short failure.**
+- **System C** — Postgres primary + sync replica + automatic failover (e.g., Patroni). Health checks detect the primary loss in ~5 seconds, the replica is promoted, traffic flows. Users see a brief error spike, then recovery. **1 fault → ~0 user-visible failure.**
+
+Same fault, three architectures. The difference is the engineering invested in making the fault *not matter*.
+
+### The three classes of fault
+
+Designing fault-tolerant systems requires knowing what kind of fault you're tolerating. Kleppmann groups them into three classes; each behaves differently statistically and demands a different toolkit.
+
+#### Hardware faults — random and (mostly) independent
+
+Disk failures, memory bit-flips, NIC failures, power-supply deaths, server crashes. At fleet scale these follow predictable rates (vendors quote MTBF in millions of hours), and they are *approximately* independent — one server crashing does not raise the probability that the next one crashes.
+
+Independence is the friendly property. It is the only reason redundancy works. Two replicas of a 99% available component, if their failures are uncorrelated, give 1 − (0.01)² = 99.99%. The whole *"more 9's = more redundancy"* intuition rests on this assumption.
+
+**The bathtub curve.** Hardware failure rate is not constant in time:
+
+```
+failure
+  rate │\
+       │ \                            /
+       │  \                          /
+       │   \________________________/
+       │  infant      useful life    wear-out
+       │ mortality
+       └────────────────────────────────────  time
+```
+
+- **Infant mortality** — new hardware shows elevated failure in the first weeks (manufacturing defects, bad batches, calibration).
+- **Useful life** — flat, low rate. MTBF is meaningful here.
+- **Wear-out** — disks, SSDs, fans, PSUs age out; the rate climbs again.
+
+Practical rule: **age diversity is a feature.** A fleet bought and deployed in one batch enters wear-out in one batch — correlated failure. Disciplined operators rotate the fleet incrementally.
+
+**Where independence breaks.** *"Two replicas = 99.99%"* assumes uncorrelated failures. In practice, common-mode causes break that:
+
+| Correlation source | Failure mode | Mitigation |
+|---|---|---|
+| Same **rack** | Rack switch or PDU dies → whole rack down | Spread replicas across racks |
+| Same **PSU/circuit** | Power feed fails → all machines on that feed go | Dual-homed power |
+| Same **AZ** | Datacenter-wide event (fire, cooling, fiber cut) | Multi-AZ |
+| Same **region** | Region-wide network/power, control-plane bug | Multi-region |
+| Same **vendor batch** | Manufacturing defect surfaces in the same week | Vendor and batch diversity |
+| Same **firmware** | A triggered bug locks every disk on that firmware | Phased firmware rollout |
+| Same **upstream dependency** | All replicas hit a single DNS, auth, or storage | Replicate the dependency or cache |
+
+Engineers tend to be correct about *horizontal* independence and blind to *vertical* correlation. If both replicas hang off the same rack switch, the switch's availability sets the ceiling — replica count is irrelevant.
+
+**Field data — vendor MTBF lies.** Backblaze's annual disk-failure reports put **AFR (Annualized Failure Rate)** around 1–2%, with model-to-model spread of 10×. Vendor-claimed MTBF, back-converted to AFR, is typically 2–3× more optimistic than measured AFR. Google's 2007 *"Failure Trends in a Large Disk Drive Population"* paper found the same: SMART indicators predict failure poorly, temperature correlates more weakly than expected, and field behavior diverges from spec sheets. **Measure your own fleet.**
+
+**Silent corruption.** The nastiest hardware fault is one no one notices: a bit flips and the application returns wrong answers. Without ECC memory, network checksums, and end-to-end storage checksums, the fault has no visible signature — it shows up as an "application bug." Half of ZFS's appeal is that it puts checksums in the storage layer end-to-end.
+
+#### Software faults — deterministic and correlated
+
+A bug triggered by a specific input. A memory leak that builds over days. A misconfigured timeout. A race condition that surfaces only under load.
+
+These are vicious because they are **correlated** — the same bug exists on every replica. Adding a second instance does not double availability; both fail on the same input. The redundancy math from hardware faults breaks here.
+
+**Bohrbug vs Heisenbug.** Two classic shapes:
+
+- **Bohrbug** — Bohr-atom solid, deterministic. Same input → same crash. Caught in tests, or at worst rolled back from production. Painful but tractable.
+- **Heisenbug** — vanishes when observed. Race conditions, timing-dependent bugs, memory corruption. Random in production, unreproducible in a debugger. The most expensive enemy of reliability engineering.
+
+Defending against Heisenbugs requires more than testing: deep observability, distributed tracing, deterministic replay, controlled fault injection.
+
+**Gray failure.** The classical model is binary — up or down. The most expensive real-world outages are **gray**:
+
+- Service is up, health check returns 200, but p99 latency is 30 seconds.
+- Replica is running but writing at 5% normal speed.
+- Process is alive but its queue has overflowed and messages are silently dropped.
+
+Load balancers see a healthy node and route traffic to it; the traffic doesn't actually succeed. The basic GET that the health check sends works; real workloads don't. Microsoft Research's *"Gray Failure: The Achilles' Heel of Cloud-Scale Systems"* (2017) named the pattern. Defenses:
+
+- **Semantic health checks** — simulate real work, not just *"are you alive?"*
+- **Outlier detection** — load balancers eject nodes whose p99 latency drifts (Envoy's *Outlier Detection* is the canonical implementation).
+- **Client-side load balancing + circuit breaking** — consumers route around slow replicas based on their own observations.
+
+**Slow rollout, fast rollback.** Software-fault correlation can't be defeated by parallelism, but it can be diluted in *time*. Don't let the bug reach every replica simultaneously. Canary deployment, blue-green, feature flags, progressive rollout. The bug ships, but only to 5% of traffic; it is observed; it is rolled back. **An MTTR play, not an MTBF play.**
+
+The alternative — *N-version programming*, where independent teams write independent implementations of the same logic — sounds appealing but rarely works in practice. It doubles cost, halves test coverage, and has shown empirically that independent teams ship correlated bugs more often than expected.
+
+**Cascading failure.** Some software faults appear only under load. The system is fast enough idle; a small slowdown queues requests; the queue grows; servicing slows further; more requests queue. Positive feedback loop, classic cascade.
+
+Typical pattern: a downstream service slows by 100 ms → upstream connection pool fills → requests block → upstream consumers time out → retries fire → load doubles → more slowdown. Thirty minutes later the entire system is down, the original fault long resolved, and the traffic pattern can't heal itself.
+
+The question to ask is not just *"what happens when this fault occurs"* but **"how does load behave when this fault occurs?"** Defenses — backpressure, load shedding, circuit breakers, retry budgets, jittered exponential backoff — all live in chapter 10. Their reason for existing is here.
+
+#### Human errors — the largest single cause of incidents
+
+Bad deploys, misconfigurations, accidental destructive commands in production, miscalculated capacity. Post-incident studies — Google SRE, AWS post-mortems, the *"Why Do Internet Services Fail"* literature — consistently find humans involved in **the majority** of significant outages, often 60–80% by definition. This is not a moral indictment; it is what happens when a complex production system has a normal-fallible-human in the operator role.
+
+**Old model vs new model.** Classical accident analysis assigns blame: *"the operator made a mistake; training was insufficient."* Modern incident analysis (Sidney Dekker, Erik Hollnagel, the resilience-engineering school) rejects this:
+
+> *Humans don't cause failures. Systems fail in the situations where humans make mistakes. The right question is: why was that system in a state where that operator's decision could break it?*
+
+The takeaway for reliability engineering is sharp: **"be more careful" is not a fix.** The fix is the systemic change that makes the same mistake impossible — or at least scoped — next time.
+
+**Blameless postmortems.** Popularized by the Google SRE book. After an incident:
+
+- *Who* made the mistake is **not asked**.
+- *Why the system accepted that mistake* is asked.
+- Names aren't used; roles are (*"on-call engineer," "deployment operator"*).
+- Action items are always **systemic**: runbooks, automation, guardrails. *"Be more careful"* is never an acceptable action item.
+
+This works because blame culture kills information flow. An operator who hides a mistake guarantees the next operator repeats it. Blameless culture surfaces mistakes, and the system improves.
+
+**The two edges of automation.** Removing the human is the headline mitigation. But automation creates two new problems:
+
+1. **The automation paradox** (Lisanne Bainbridge, 1983). Humans hand off the routine; what's left is exactly the edge cases automation can't handle — the hardest ones. With less practice, humans face harder problems. *Automation does not make work easier; it changes work, often making it harder.*
+2. **Automation's blast radius is wider than a human's.** A human running the wrong command affects one server. Automation running the wrong command affects the *fleet*. So automation requires guardrails: rate limiting, dry-run modes, *"affect one cell, not all of production"* design.
+
+**Blast-radius limiting — the most important architectural technique.** Bound the impact of any single mistake (human or automated):
+
+- **Cell architecture.** Partition production into isolated *cells*, each carrying 5–10% of traffic. A cell going down means 5% impact. AWS uses this; Slack's *"cellular architecture"* essay is a practical reference.
+- **Shuffle sharding.** Assign customers randomly across replicas so no two customers share their full set. One replica's death affects a small fraction of customers, not all of them. This is how AWS Route 53 hits its availability target.
+- **Least privilege.** An engineer's deploy permission should not be the same scope as their *drop-table* permission. A mistake in one domain doesn't propagate.
+- **Confirmation, dry-run, canary in tooling.** Destructive commands announce intent, refuse to run without explicit approval, and apply changes in small increments before fanning out.
+
+**"Production is hostile."** The cultural posture: every touch on production is a potential incident.
+
+- Manual SSH to production is exceptional (some shops alarm on it).
+- All changes are made through code (Infrastructure as Code, GitOps).
+- No action is taken without an audit log.
+- Tooling investment beats manual labor at scale.
+
+### Measuring reliability — MTBF, MTTR, availability
+
+Reliability needs a numerical language. Three terms:
+
+- **MTBF** — Mean Time Between Failures. Average uptime between failures. A *fleet* metric.
+- **MTTR** — Mean Time To Recovery. Average time from failure to restoration; the sum of *detect + respond + repair + verify*.
+- **Availability** — A = MTBF / (MTBF + MTTR). The fraction of time the system is up.
+
+The strategic insight: there are two ways to attack availability — make MTBF bigger, or make MTTR smaller — and **MTTR is usually the cheaper side.** Hardening MTBF asymptotes; halving MTTR via observability and automation often pays back many times over. Modern SRE practice — the **DORA** metrics (MTTR + Change Failure Rate + Deploy Frequency + Lead Time) — reflects this. MTBF is conspicuously absent; the modern bet is on fast recovery rather than rare faults.
+
+The full arithmetic — composition rules, the 9's downtime table, why each 9 costs 10× — is in [availability-math.md](./availability-math.md).
+
+### Soft vs hard dependencies
+
+In a series chain, not every dependency is equal. **Hard** dependencies fail the request when they fail. **Soft** dependencies degrade quality but don't break the request — a cache miss, a missing recommendation, a fallback ranking. A soft dependency in a failed state is treated as A = 1 in the chain; it doesn't tax the product.
+
+Mature architectures convert hard dependencies into soft ones wherever possible. Twitter timelines tolerate a down ranker. Stripe accepts payments and pushes fraud-detection async. DNS resolvers serve stale records during upstream outages (RFC 8767's *serve-stale*). Each conversion raises the dependency-chain ceiling.
+
+### Structural redundancy
+
+Once dependencies are minimized and corrected, the remaining lever is **redundancy** — having more than one of each component. The pattern catalog (active-passive, active-active, N+1 / 2N, geographic redundancy, the *"untested redundancy is no redundancy"* discipline) lives in [redundancy-patterns.md](./redundancy-patterns.md).
+
+### What §2 covers, what §2 doesn't
+
+§2 is the *foundation* of reliability — the conceptual lens (fault vs failure), the statistical language (MTBF / MTTR), and the fault taxonomy (hardware / software / human). Real reliability engineering builds five further layers on this foundation, each its own discipline and each its own home in this handbook:
+
+| Layer | What it does | Where in the handbook |
+|---|---|---|
+| Structural redundancy | Replicas, failover, quorum, multi-AZ/region | Rest of §2 + chapter 6 (consensus) + chapter 9 (deployment & scaling) |
+| Reliability patterns | Circuit breaker, bulkhead, retry/backoff, timeout, idempotency, graceful degradation | Chapter 10 |
+| Detection & response | Monitoring, alerting, on-call, SLI/SLO, error budgets, incident response | §8 (this chapter, SLI/SLO) + chapter 11 (observability) |
+| Recovery | Backup, restore, disaster recovery, RPO/RTO, data integrity | Chapter 7 (storage) |
+| Test & exercise | Chaos engineering, fault injection, game days, load testing | Chapter 10 |
+| Operational discipline | Blameless postmortems, runbooks, change management, SRE practice | Cross-cutting; mostly chapter 9 + chapter 11 |
+
+§2 teaches the anatomy — bones. The muscles (patterns), nervous system (observability), immune system (chaos), and operational fitness (SRE practice) are taught in dedicated chapters.
+
+### §2 recap
+
+In one sentence: **reliability engineering is the discipline of preventing faults from becoming failures.**
+
+Three ideas in order:
+
+1. **Fault ≠ failure.** Components break; the system stays up. The design goal isn't *"no faults"* — it's *"faults that don't matter."*
+2. **Three fault classes, three toolkits.** Hardware (independent → redundancy works), software (correlated → slow rollout + fast rollback), human (systemic → guardrails + automation + blameless culture).
+3. **Two metrics, one formula.** MTBF (failure rate), MTTR (recovery speed), A = MTBF / (MTBF + MTTR). MTTR is usually the cheaper side to attack.
+
+Pattern repertoire (full treatment in [redundancy-patterns.md](./redundancy-patterns.md)):
+
+- **Active-passive** for stateful single-writer systems (RDBMS).
+- **Active-active** for stateless or partitioned workloads (API, CDN).
+- **N+1 / 2N** sized to the failure mode you defend against.
+- **Multi-AZ** by default, **multi-region** for critical paths, **multi-cloud** rarely worth it.
+
+The sentence to keep at the top of any architecture review:
+
+> *Hardware will fail. Bugs will ship. Humans will mistype. The only question is whether your system is designed so that any of those turns into the user seeing a broken product.*
+
+---
+
 ## Next
 
-- §2 — Reliability deep dive
 - §3 — Scalability deep dive
 - §4 — Maintainability deep dive
 - §5 — Back-of-envelope estimation
