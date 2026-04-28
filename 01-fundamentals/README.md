@@ -566,9 +566,383 @@ The sentence to keep at the top of any scalability discussion:
 
 ---
 
+## 4. Maintainability — deep dive
+
+§1 framed maintainability as *"making life easier for the engineers who come after you"* and split it into three sub-axes — operability, simplicity, evolvability. That sentence is easy to read as a soft, cultural concern. It is not. Maintainability sits next to reliability and scalability on the quality-axis table because it is the dominant **cost axis** of any long-lived system, and the daily friction it imposes determines how fast a team can keep doing useful work.
+
+This section walks the three sub-axes in turn — what each means, how it is measured (or its proxies), what its tools are, and how it interacts with the other quality axes.
+
+### Why maintainability is its own axis
+
+Two facts force the framing.
+
+**Most of a system's cost is paid after the first release.** The classic estimate — Boehm's *Software Engineering Economics* (1981), reaffirmed by every subsequent industry survey — is that around **70%** of a software system's lifetime cost is spent after launch: bug fixes, feature additions, on-boarding new engineers, on-call response, dependency upgrades, security patches. The "build it" phase is the small part of the bill. Anything that compounds friction in the post-launch phase compounds the bill.
+
+**Engineering velocity is a function of the codebase, not the engineer.** A senior engineer in a maintainable system ships a feature in a day; the same engineer in an unmaintainable system spends a day understanding the existing code and a week defending against side-effects. The labor cost of every future change is paid in the maintainability that exists at the moment of the change.
+
+This is why modern SRE practice measures maintainability operationally rather than aesthetically. The **DORA metrics** (Forsgren, Humble, Kim — *Accelerate*, 2018) — Deploy Frequency, Lead Time for Changes, Change Failure Rate, MTTR — are, in effect, four numbers that quantify how maintainable a system is in production terms. *"Our codebase is clean"* is unfalsifiable; *"our lead time for a typical change is 30 minutes"* is not.
+
+The headline cultural cliché — *"good ops can compensate for bad software, but good software cannot run reliably with bad ops"* — is a maintainability claim. Either side of the equation, the system's day-to-day practicality dominates its day-one elegance.
+
+### Three sub-axes
+
+Kleppmann's split is canonical: **operability, simplicity, evolvability**.
+
+| Sub-axis | One-line definition | Anchor question |
+|---|---|---|
+| **Operability** | The system is easy to *run*. | "When the page fires at 3 a.m., what do I have in my hands?" |
+| **Simplicity** | The system is easy to *understand*. | "How long until a new engineer ships their first PR?" |
+| **Evolvability** | The system is easy to *change*. | "When the requirements move, does the codebase resist?" |
+
+The names map onto three different **time horizons**:
+
+- **Operability** → daily — incidents, deploys, ad-hoc debugging (minutes/hours).
+- **Simplicity** → weekly/monthly — new features, bug investigations (days/weeks).
+- **Evolvability** → yearly — architectural shifts, schema migrations, framework upgrades (months/years).
+
+A system can be strong on one and weak on the others. Easy to debug at 3 a.m. (operability ✓) but tangled inside (simplicity ✗) — runbooks are good, no one understands the code. Code is short and clear (simplicity ✓) but riddled with implicit assumptions (evolvability ✗) — adding one field breaks twelve files. The three axes have to be tracked separately because the techniques that improve them are mostly distinct.
+
+---
+
+### 4.1 Operability
+
+Operability asks: *"How much does the system help its operators do their job — and how much does it fight them?"*
+
+#### "Good operations vs good software" — the central asymmetry
+
+Kleppmann's hinge sentence in this section:
+
+> *"Good operations can often work around the limitations of bad software, but good software cannot run reliably with bad operations."*
+
+Both halves matter. A senior SRE team can keep a badly designed legacy system afloat for years through runbooks, automation, and human intervention. And a beautifully designed system, deployed without operational discipline — undocumented deploys, no health checks, no on-call rotation — will be unreliable regardless of how clean its code is.
+
+The goal of operability is to **shrink the gap between the information the system *needs* from the operator and the information the system *gives* the operator**. When that gap is wide — when the operator must read source code to understand what is happening — the system is not operable, no matter what its README claims.
+
+#### Operability is a system property, not a team property
+
+A common confusion is to treat operability as the quality of the operations team. It is not. Give the same senior SRE team two systems:
+
+- **System A** — health endpoints, structured logs, automated failover, every alert linked to a runbook, deploys in one command.
+- **System B** — log files scattered across hosts, deploys live in a 14-step wiki page, the failover procedure begins with *"the on-call manually changes the DNS record."*
+
+Same team. On A, the on-call makes the right decision half-asleep; on B, they spend twenty minutes reconstructing what happened. The system's operability — not the operator's competence — sets the ceiling.
+
+The practical test: *"Can a new on-call engineer, equipped only with the runbook, respond to this alert without touching the source code?"* If yes, the system is operable.
+
+#### Components of an operable system
+
+Operability decomposes into a small number of concrete attributes. Industry practice converges on a list close to the following:
+
+| Component | What it is | What its absence costs |
+|---|---|---|
+| **Visibility** | Metrics, structured logs, distributed traces — the operator can *see* what is happening | The operator guesses; MTTR explodes |
+| **Predictability** | Behavior is consistent, surprises are rare | Every incident is a new mystery |
+| **Good defaults** | Typical use works with zero configuration; deviations require explicit override | When the one person who knew the setup leaves, the system dies |
+| **Automation** | Routine work — deploy, restart, scale, failover — is scripted | Manual work invites human error (§2) |
+| **Self-healing** | The system recovers from small faults on its own (restarts, retries, automatic failover) | Every small fault becomes a page |
+| **Documentation + runbooks** | Every alert has a *"what does this mean / what to do"* page | Tribal knowledge — leaves when the human leaves |
+| **Decoupled lifecycle** | Components can be restarted, upgraded, removed without taking the rest of the system down | Every maintenance window is a full outage |
+
+Each missing item from this list lands as friction on the operator's back. Maturity is not about scoring 10/10 on every row — it is about knowing which rows are weak and tracking the ones that matter most for the system's failure modes.
+
+#### "Production is hostile" — the cultural posture
+
+In §2 the human-error section introduced the *"production is hostile"* posture: manual SSH is exceptional, every change is made through code, audit logs are everywhere. That posture is a **consequence** of operability discipline:
+
+- Manual intervention = opportunity for human error → **minimize**.
+- Tooling investment beats manual labor at scale → **pay it up front**.
+- Every change is auditable → **post-mortems are possible; tribal knowledge is bounded**.
+
+This is why modern operability conversations revolve around *"take the human's hand off production."* But §2's **automation paradox** still applies: when routine work is automated, what remains for the human is the *hard* edge cases. *"I automated everything, operability is done"* is a milestone that does not exist — operability is a continuous practice, not a state.
+
+#### Operability and reliability — where they meet
+
+Recall §2's availability formula:
+
+```
+A = MTBF / (MTBF + MTTR)
+```
+
+Operability **directly attacks MTTR**. MTTR has four components:
+
+```
+MTTR = detect + respond + repair + verify
+```
+
+Operability shows up in all four:
+
+- **Detect** — visibility (the canonical observability pillars: metrics, logs, traces; alerting on top).
+- **Respond** — runbook quality, on-call routing, escalation paths.
+- **Repair** — self-healing depth, the count of manual steps left in the recovery procedure.
+- **Verify** — visibility again (how do you know the system is back?).
+
+§2 noted that *"reducing MTTR is usually cheaper than raising MTBF."* Operability is the practical surface where that bet is paid in. The DORA metrics — Deploy Frequency, Lead Time, Change Failure Rate, **MTTR** — codify it: MTBF is conspicuously absent; the modern wager is on fast recovery, and operability is what makes fast recovery possible.
+
+#### Observability ≠ operability — a quick disambiguation
+
+Two terms that get conflated:
+
+- **Monitoring** — watching for problems you already know about. *CPU > 80% → alert.* The list of things to watch is fixed.
+- **Observability** — being able to explain problems you didn't anticipate, from the system's existing output, **without shipping new code** to the system. The phrase entered the system-design vocabulary via Charity Majors and the Honeycomb team in the late 2010s.
+
+Observability is the foundation of operability's *visibility* component. Without observability, no system is fully operable. But observability is **not** operability — having logs and having *"the right log on hand within 30 seconds at 3 a.m."* are different problems. The full treatment of observability — three pillars (metrics, logs, traces), continuous profiling as a fourth — lives in chapter 11. This section uses observability only as one input to operability.
+
+#### Automation, runbooks, self-healing — the decision tree
+
+When a recurring operational task lands on the team, three options are evaluated in order:
+
+1. **Can the work be eliminated entirely?** Make the system heal itself. Always ask first — automation that fixes a problem the system shouldn't have had in the first place is wasted code.
+2. **If not, can it be automated?** Script + guardrail (dry-run, rate limit, cell-bounded blast radius — §2). The risk is the *automation paradox*: the surface left for humans grows harder, not easier.
+3. **If not, write a runbook.** A runbook is the contract for *"a human runs this, but the steps are determined."* Every alert that pages a human must link to a runbook; *"page fired but no runbook"* is itself an operability bug.
+
+The anti-pattern is **automation without a fallback runbook**. When the automation fails — and it will — a human has to step in; if that human has no runbook, the team improvises under pressure. Correct practice: automation runs by default, failure of automation pages a human *with a runbook*.
+
+The general rule of thumb: any manual step performed **three times** earns either a script or a runbook. Leaving it in the gray zone is what lets tribal knowledge accumulate.
+
+#### Cattle, not pets
+
+The slogan attached to operability — already encountered in §3's stateless discussion — is short and load-bearing:
+
+> Servers must be **cattle** (numbered, interchangeable, replaced when sick), not **pets** (named, special, individually nursed).
+
+The operational test: *"Kill any node, bring up an identically-configured replacement. Does the system behave the same?"* If no, the system is not fully operable — every node carries unique knowledge, and the on-call must keep a map of *"which node does what."* The whole ergonomics of cloud-native runtimes (Kubernetes, ECS, serverless platforms) is built around making this test trivially pass.
+
+---
+
+### 4.2 Simplicity
+
+If operability is *"how easy is the system to run,"* simplicity is *"how easy is it to understand."*
+
+#### Definition — the cost of the mental model
+
+Simplicity is **not** "less code," "fewer features," or "fewer files." Simplicity is **the low cost of the mental model** the system imposes on its readers. When a new engineer reads a feature, how much state do they have to load into their head before the feature makes sense?
+
+The most-quoted formulation is Tony Hoare's:
+
+> *"There are two ways of constructing a software design: one way is to make it so simple that there are obviously no deficiencies; the other is to make it so complicated that there are no obvious deficiencies."*
+
+Simplicity is hard to define directly, so Kleppmann tracks its inverse — **complexity** — which is observable. Recurring symptoms:
+
+- **State explosion** — global variables, implicit dependencies, hidden side-effects.
+- **Tight coupling** — changing one module breaks unexpected places.
+- **Tangled dependencies** — A depends on B depends on C depends on A.
+- **Special cases** — long lists of *"except when X, then Y."*
+- **Inconsistent naming** — same concept under three names; different concepts under one.
+- **Performance hacks** — *"don't touch this line, it's slow if you do, no one knows why."*
+
+Each symptom is a deferred cost on every future reader.
+
+#### Essential vs accidental complexity
+
+The single most useful distinction in the simplicity literature, from Fred Brooks' *No Silver Bullet* (1986):
+
+- **Essential complexity** — complexity *intrinsic to the problem*. *"You are doing multi-currency invoicing, exchange rates fluctuate, every country's tax code is different."* This complexity is in the world, not the code. There is no way out.
+- **Accidental complexity** — complexity *introduced by the way you chose to solve the problem*. Wrong abstractions, unnecessary frameworks, premature generalization, *"we might need this someday"* hooks. This complexity buys nothing; it is pure cost.
+
+The simplicity discipline = **drive accidental complexity toward zero, accept the essential.** Brooks argued that no "silver bullet" tool can attack the essential side (no 10× productivity multiplier). Reducing accidental complexity is a daily engineering discipline, not a tool.
+
+The practical test for any block of code: *"How would I justify this to someone who only knows what the product does?"* If the answer requires concepts that are not part of the problem, the code is accidental.
+
+#### Abstraction — a double-edged tool
+
+Abstraction is the primary lever of simplicity *and* the primary source of accidental complexity. The same instrument cuts both ways.
+
+**A good abstraction** hides a complexity, presents a simple interface, and the user does not need to know what is underneath. Programming languages, file systems, SQL, HTTP, TCP — successful abstractions. *"You can do work without thinking about the layer below."*
+
+**A bad abstraction** does not hide the underlying complexity; it merely *displaces* it or *adds another layer to it*. Joel Spolsky's **Law of Leaky Abstractions**: *"All non-trivial abstractions, to some degree, are leaky."* An ORM hides SQL — until a performance problem forces you to drop into SQL anyway. Kubernetes hides networking — until a DNS bug drags you through the entire CNI plugin stack. When an abstraction leaks, the user has to learn *two* things: the abstraction *and* what it was hiding.
+
+The tests for an abstraction worth keeping:
+
+1. **Does it reduce complexity, or just move it?** If the same complexity sits underneath and surfaces often, you have only added a layer.
+2. **Does it cut at the right boundary?** Does the user's mental model match the interface the abstraction provides? Wrong boundary = constant fighting against the abstraction.
+3. **Is it paying for genericity it doesn't need?** A single abstraction trying to serve three different users may fit none of them well.
+
+The practical guideline: **concrete code first, abstraction second.** Two similar pieces of code are not yet candidates for abstraction; three similar pieces are (the *Rule of Three*). Abstracting for hypothetical future users — *speculative abstraction* — is the leading source of accidental complexity in real codebases.
+
+#### "Clever code is the enemy"
+
+Simplicity, like operability, requires a posture. The canonical formulation is Brian Kernighan's:
+
+> *"Debugging is twice as hard as writing the code in the first place. Therefore, if you write the code as cleverly as possible, you are, by definition, not smart enough to debug it."*
+
+This is not a stylistic preference; it is a **team-scale** argument. The author of clever code will not be at the company in two years; the next reader has to debug it. The principles related to it — *boring technology* (covered in §9), *YAGNI* (You Aren't Gonna Need It), *Rule of Least Astonishment* (the code should do what its reader expects) — are the daily practice of simplicity.
+
+#### Measuring simplicity
+
+Simplicity does not collapse to a single number. The proxies, in order of usefulness:
+
+| Proxy | What it captures | Limit |
+|---|---|---|
+| **Onboarding time** — days to first PR | Mental-model cost of the codebase | High variance across people |
+| **Cyclomatic complexity** — branches per function | Local complexity | Misses system-level complexity |
+| **Coupling metrics** — between-module dependency degree | Structural complexity | Tooling immature |
+| **Time-to-debug** — hours from incident to root cause | Operational shadow of understandability | Confounded by incident type |
+| **PR review time** — minutes to comprehend a change | Code readability | Depends on reviewer discipline |
+
+No single metric tells the whole story. Mature teams watch the **trend** of these proxies — onboarding *getting longer*, time-to-debug *climbing* — as the early signal.
+
+#### Simplicity and the other axes
+
+The tensions in §1's table land here concretely:
+
+- **Reliability** — adding redundancy, failover, replication makes the system more complex. The 99.9 → 99.99 jump charges complexity as part of its bill.
+- **Scalability** — distributed systems are a step more complex than single-node systems. *"Premature horizontal"* (§3) is exactly this trade-off, paid badly.
+- **Performance** — clever optimization is the chief enemy of simplicity. Knuth's full quote (almost always truncated): *"Premature optimization is the root of all evil. Yet we should not pass up our opportunities in that critical 3%."* For the real 3% bottleneck, the complexity is worth it; everywhere else, it is not.
+- **Evolvability** — **aligned**. Simple code is changeable code. Loose coupling, modular boundaries, and small abstractions feed both at once.
+
+---
+
+### 4.3 Evolvability
+
+Operability is *"how do I run this system,"* simplicity is *"how does this system work,"* evolvability is *"how do I **change** this system?"*
+
+#### Why evolvability is its own sub-axis
+
+Change is not optional, it is **inevitable**:
+
+- Requirements change — the product hypothesis was wrong; pivot.
+- Scale changes — yesterday's architecture does not carry today's load (§3's *"premature/late horizontal"* dilemma).
+- Laws change — GDPR, PCI-DSS, evolving regional regulation.
+- Dependencies change — your database is deprecated, your framework released a breaking v2, your vendor was acquired.
+- Your understanding changes — the *"correct solution"* you committed to two years ago is no longer correct.
+
+No matter how well-designed the day-one system is, *"the design we made on day one"* will not stay valid forever. The evolvability question is sharper: **how painful will the inevitable change be?**
+
+#### Agility vs evolvability — different scales
+
+Two concepts that get conflated:
+
+- **Agility** — change velocity at the **team** level. Scrum, lean, CI/CD, short feedback loops. *"How fast can the team take on new work?"*
+- **Evolvability** — change velocity at the **system** level. Once an architectural decision has been made, how expensive is it to switch to a different one. *"Does the existing design accommodate the new requirement, or fight it?"*
+
+An agile team on top of an inevolvable system has fake velocity — sprints close, but every feature takes twice as long because of *structural resistance*. The reverse exists too: a highly evolvable system carried by a slow team — only money is lost.
+
+The practical consequence: agility is a people/process problem, evolvability is an **architectural** problem. Kleppmann separates evolvability from operability and simplicity for exactly this reason.
+
+#### Reversibility — Bezos's one-way and two-way doors
+
+The most useful operational framing of evolvability comes from Amazon — Jeff Bezos's *"two types of decisions"*:
+
+> *Type 1 decisions — one-way doors. Walk through them and you cannot come back. Make them slowly, with lots of analysis.*
+>
+> *Type 2 decisions — two-way doors. Walk through, see the other side, walk back if you do not like it. Make them quickly.*
+
+System architecture reduces to one question per decision: **what does it cost to change my mind on this?** Low — two-way door, move quickly. High — one-way door, deliberate carefully.
+
+Improving evolvability = **converting one-way doors into two-way doors**. The more decisions can be reversed, the lower the risk of being trapped by a wrong call, the cheaper it becomes for the team to experiment, the less pressure to *"get it perfect now."*
+
+Which architectural decisions tend to be one-way:
+
+| One-way (hard to reverse) | Two-way (easy to reverse) |
+|---|---|
+| Programming-language choice | Library choice |
+| Database engine (Postgres → Cassandra) | Schema change (with migration) |
+| Public API contract (consumers in production) | Internal API |
+| Data model (denormalized, replicated) | Adding an index |
+| Microservice boundaries | Module boundary inside one service |
+| Event payload schema (consumers in production) | Adding a new topic |
+
+A discipline lives in the question: **is the thing I am calling a two-way door actually two-way?** *"We will split it later"* often becomes an 18-month refactor three years later — meaning it was one-way all along, just disguised.
+
+#### Coupling — the structural enemy
+
+Evolvability's one-sentence structural question: **when I change one place, how many other places break?**
+
+This question's technical name is **coupling**. Two ends of a spectrum:
+
+- **Tight coupling** — changing module A breaks B, C, D. Change propagates.
+- **Loose coupling** — changing A only affects A as long as A's *contract* (interface, schema) is unchanged.
+
+Loose coupling is the raw material of evolvability. The practical instruments:
+
+- **Modular boundaries** — explicit interfaces, hidden implementation. Inside the module, anything goes; the contract to the outside is fixed.
+- **Dependency direction** — dependency flow is deliberate; no anti-patterns like *"core domain depends on UI."*
+- **Schema as contract** — the internal data structure and the externally-published contract are different objects. Inside the system, change freely; outside, change *versioned*.
+
+The original theoretical argument for microservices was this — *"service boundaries enforce loose coupling."* The argument did not hold in many places in practice (network calls can re-introduce the same tight coupling at higher cost), but the framing of *"track coupling as the metric"* survived.
+
+#### Schema evolution — the concrete touchpoint
+
+The place evolvability shows up most often in daily practice: **changing the data format of a system already in production.** Three scenarios for changing an API request schema or an event payload:
+
+1. **Backward compatibility** — *new server understands old clients*. New fields are optional, old fields stay around. Producers can be upgraded first.
+2. **Forward compatibility** — *old server does not crash on what new clients send*. Unknown fields are silently ignored. Consumers can be upgraded first.
+3. **Breaking change** — neither holds. All sides must be upgraded simultaneously — close to impossible in a large system.
+
+The serialization formats designed for this (Protobuf, Avro, Thrift) use *tag-based encoding* — fields are referenced by **tag number**, not by name or position. Adding a new field cannot break old readers. The literature on *schema evolution* is built around this discipline. The detail belongs in chapter 4 (communication); the point here is that **evolvability is rhetoric until it has a concrete schema discipline behind it.** *"Our system is open to change"* and *"our event payloads are Protobuf with versioned schemas"* are different sentences.
+
+#### Test coverage as enabler
+
+What practically makes a system evolvable is the system that *tells you what broke when you changed something*. That system is **automated tests**.
+
+A system with low test coverage is mechanically inevolvable — every change shrinks under the question *"did something break?"* Refactoring becomes risky. Ossification (next subsection) sets in.
+
+The rule of thumb: *"If you do not trust that passing tests means you can deploy to production, the system cannot be refactored."* And a system that cannot be refactored cannot evolve, regardless of how elegantly it was designed on day one.
+
+This is why modern *trunk-based development* and *continuous deployment* are, at root, an **evolvability posture**: take small changes, validate them quickly, roll them back quickly. All three of those make evolution practical.
+
+#### Ossification — the maintenance discipline
+
+Systems are not born evolvable; they do not stay evolvable. **Ossification** is the gradual stiffening of a system against change. The causes accumulate:
+
+- New decisions sit on top of old decisions; the lower layers can no longer be changed.
+- Test coverage decays; the courage to refactor decays with it.
+- Tribal-knowledge holders leave; *"no one dares change this code"* zones appear.
+- Production APIs accumulate consumers who cannot all be upgraded.
+- Temporary hacks become permanent — *"we will fix it later"* never arrives.
+
+Evolvability is therefore a **maintenance practice**, not an architectural property: *maintainability is not a state you reach, it is a discipline you sustain.*
+
+The practical instruments against ossification:
+
+- **Refactoring slack** — 10–20% of the team's time is spent on code health. Without this slot, technical debt only ever grows.
+- **Strangler fig pattern** — instead of replacing a legacy system atomically, the new implementation grows around it; the old one is gradually starved out. Named by Martin Fowler in 2004; the dominant pattern in legacy migration today.
+- **Architecture Decision Records (ADRs)** — *"why we made this decision"* is documented at the time of the decision. Three years later, when someone asks *"why is it like this,"* the record answers — and *"this decision is no longer valid"* becomes part of the record.
+- **Killing things** — unused code, deprecated endpoints, dead features are *removed*. Keeping them is not free — it is permanent mental load and an attachment point for new coupling.
+
+#### Evolvability and the other axes
+
+- **Reliability** — tension. *"Ship changes constantly"* (evolvability) and *"keep production stable"* (reliability) appear to fight. Modern SRE practice reconciles them with **error budgets** (covered in §8): change as fast as the SLO allows; brake when the budget is spent.
+- **Scalability** — tension. A scaling decision (sharding, denormalization) is usually a one-way door — expensive to undo. Evolvability argues for **postponing the decision** — *"do not shard until you have to."*
+- **Simplicity** — **aligned**. Simple code is easier to change. Loose coupling, modular boundaries, small abstractions help both. The *"future-proof flexibility"* (factories, plugin systems, config-driven everything) added speculatively breaks both — too soon to know which generalization is correct, you generalize the wrong way.
+- **Operability** — aligned. Cattle-not-pets, automated deploys, IaC make change *operationally* cheap. Evolvability's system-level claim resolves to operability's daily practice.
+
+---
+
+### What §4 covers, what §4 doesn't
+
+§4 names the three sub-axes of maintainability and the conceptual lens for each. The day-to-day instruments — the patterns, tools, and operational disciplines that make a system actually maintainable — live in dedicated chapters across the rest of the handbook.
+
+| Concern | Where in the handbook |
+|---|---|
+| Observability stack — metrics, logs, traces, profiling | Chapter 11 |
+| Deployment topology, IaC, blue/green, canary, progressive delivery | Chapter 9 |
+| Reliability patterns — circuit breaker, bulkhead, retry/backoff, graceful degradation | Chapter 10 |
+| SLI / SLO / error budget — the operational language for trade-offs | §8 of this chapter |
+| Schema evolution, API versioning, message format compatibility | Chapter 4 |
+| Storage migrations, online schema change | Chapter 7 |
+| Engineering principles — boring technology, YAGNI, simplicity as a feature | §9 of this chapter |
+
+§4 supplies the language. The rest of the handbook supplies the techniques.
+
+### §4 recap
+
+In one sentence: **maintainability is the engineering of a system's day-to-day cost — the friction of running it, understanding it, and changing it over its lifetime.**
+
+The three anchors:
+
+1. **Operability** — *help the operators*. Visibility, predictability, automation, runbooks, self-healing, cattle-not-pets. The system is operable when *"any node, any time"* is replaceable and every alert links to a runbook. MTTR is the metric that moves with it.
+2. **Simplicity** — *attack accidental complexity, accept the essential*. The mental-model cost of the codebase. Abstractions are double-edged; concrete code first, abstraction by Rule of Three. Onboarding time and time-to-debug are the proxies.
+3. **Evolvability** — *make tomorrow's change cheap*. Convert one-way doors into two-way. Loose coupling, schema versioning, test coverage, refactoring slack, the strangler fig. The fight is against ossification, and the discipline is permanent.
+
+The sentence to keep at the top of any maintainability discussion:
+
+> *Most of a system's lifetime cost is paid by the engineers who arrive after launch. Maintainability is the engineering of how much that costs.*
+
+---
+
 ## Next
 
-- §4 — Maintainability deep dive
 - §5 — Back-of-envelope estimation
 - §6 — Capacity planning ritual
 - §7 — Mental models
