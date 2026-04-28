@@ -344,9 +344,230 @@ The sentence to keep at the top of any architecture review:
 
 ---
 
+## 3. Scalability — deep dive
+
+§1 defined scalability as *"the system's ability to cope with growth"* and added the warning that the word *scalable* alone is meaningless. This section unpacks that warning. Scalability is not a property a system either has or doesn't — it is a *response to a specified change in load*, and the response is honest only if you can name the load axis, the target value, the time horizon, and the cost.
+
+The chapter walks the same path the rest of the handbook will refer back to: how to define the load you are scaling for, what *vertical* and *horizontal* actually mean (and why the right answer is usually neither alone), why stateless design is the precondition of horizontal scaling, why averages lie about performance, and the two laws — Amdahl and Gunther's Universal Scalability — that bound how much parallelism can buy you.
+
+### "Scalable" is not a claim on its own
+
+The popular intuition is that *scalable = big, or fast, or able to serve many users.* All three are wrong. A system serving a million users today may not be scalable; a system serving fifty users today may be deeply scalable. Current size says nothing about scalability.
+
+Kleppmann's definition is precise:
+
+> **Scalability — the system's ability to cope with increased load.**
+
+Two words inside the sentence carry the weight: *increased*, and *load*. Scalability is not a static property; it is the system's behavior under a change. And the change has to be specified — *which* load.
+
+That specification matters because the same system can be excellent on one axis and collapse on another. The classical illustration is Twitter's two operations: posting a tweet and reading a timeline. *Fan-out on read* — compute the timeline by joining all followed users at read time — makes posting cheap and reading expensive. *Fan-out on write* — at post time, copy the tweet into every follower's timeline cache — makes posting expensive and reading cheap. Asking *"which is more scalable?"* is the wrong question. The right questions are *which axis is growing*, and *what does the load distribution look like*. Twitter ended up running both: fan-out on write for normal users, fan-out on read for celebrities whose follower counts make write fan-out catastrophic.
+
+The operational rule that comes out of this:
+
+> A system is scalable along **load parameter X**, from **value Y** to **value Z**, over **time horizon W**, at **cost C**.
+
+Five blanks, all mandatory. Drop any of them and the claim becomes marketing.
+
+### Load parameters — the numbers that define your system
+
+A load parameter is a number, or a small set of numbers, that describes how much work the system is doing. It is not necessarily QPS; it has to be the dimension that drives the bottleneck. If increasing the parameter strains the system, it is a load parameter. If it does not, it is just a metric.
+
+Different systems are described by different parameters:
+
+| System | Primary load parameter | Secondary |
+|---|---|---|
+| HTTP / OLTP API | Requests per second | Concurrent users, p99 budget |
+| Realtime chat (Slack, WhatsApp) | Concurrent connections | Message rate, fan-out per message |
+| Database (OLTP) | QPS + read/write ratio | Working set size, transaction size |
+| Database (OLAP) | Query complexity × scanned data | (QPS is rarely meaningful) |
+| Batch / ETL | Volume per window (GB/hour) | Job count |
+| Object storage (S3-class) | Total objects + GET/PUT ratio | Object size distribution |
+| CDN / edge | Bandwidth (Gbps) + cache hit rate | Origin request rate |
+| Search engine | Queries per second × index size | Document update rate |
+| Social network (Twitter pattern) | Posts/sec + follower distribution | Timeline read rate |
+| Multiplayer game server | Concurrent players per shard | Tick rate × state size |
+
+"QPS" is not a universal currency. Asking an OLAP warehouse for its QPS misses the point — a single query may scan terabytes for ten minutes, and counting them is meaningless. Each system type has its own load language, and capacity planning starts by picking the right one.
+
+#### The mean is the wrong number
+
+The deeper trap is choosing a single average to summarize the load. Real-world load distributions are almost never uniform; they are skewed, often power-law, with a long tail that dominates everything.
+
+Twitter's published numbers from the early 2010s make the point. Posts averaged ~4.6k/sec at steady state and ~12k/sec at peak — modest. Timeline reads averaged ~300k/sec — large but tractable. The dangerous number was elsewhere: the **distribution of follower counts**. The median user has roughly 200 followers, the mean is around 700, p99 is around 10,000, and the maximum is on the order of **100 million**. The ratio between mean and max is roughly five orders of magnitude. A system designed for the *average tweet* — 700 fan-outs per post — falls over the moment a celebrity tweets, because that single post carries the cost of a hundred thousand average posts.
+
+This pattern recurs everywhere under different names — *hot key*, *hot partition*, *celebrity problem*. e-commerce: the average product is viewed twice a minute, the homepage feature is viewed two hundred thousand times. Slack: the average channel has 50 members, the all-hands channel has 50,000. Stripe: the average merchant runs a thousand transactions a month, the largest run ten million a day. YouTube: the average video gets a handful of views, the viral video gets a hundred thousand views per second. In all cases the system designed for the mean breaks under the tail.
+
+The minimum honest description of load:
+
+1. **Mean** — the floor for capacity planning.
+2. **Peak** — usually 2–5× mean. Architecture is sized for peak; cost is sized for mean.
+3. **p99 (or higher)** — the shape of the tail, the place where hot-key failures live.
+
+If your "transaction count" is one number, suspect it is incomplete. Almost every real load has a *count × size* shape — and in skewed distributions, the few largest items account for most of the cost.
+
+### Vertical vs horizontal — and why diagonal usually wins
+
+Once the load profile is honest, the question of *how to grow* admits two answers. The folk story — *"vertical is dead, everyone scales horizontally now"* — is wrong. The two are complementary; most systems live with both.
+
+**Vertical scaling (scale up)** keeps the architecture and grows the machine. 4 vCPU becomes 64. 16 GB RAM becomes 1 TB. The codebase does not change.
+
+- *Pros.* No distributed-systems problems. ACID, joins, in-process locks all keep working. Latency stays in-process — RAM access is around 100 ns, network round-trip is 500 µs (5,000× the gap). Operationally cheap: one machine to monitor, one to deploy.
+- *Cons.* There is a ceiling. Cloud providers' largest instances run into the millions of dollars per year and still represent a single point of failure. Cost above mid-tier is super-linear: a 2× larger instance is often 3–5× more expensive. Resizing usually requires a reboot, which stateful workloads tolerate poorly. NUMA effects on very large machines mean naive software does not get the speedup the spec sheet promises.
+
+**Horizontal scaling (scale out)** adds machines. A single server becomes ten, ten thousand, a hundred thousand. Load is split across them.
+
+- *Pros.* No theoretical ceiling — Google, Meta, AWS run hundreds of thousands of nodes on this principle. Cost stays roughly linear because commodity instances are priced commodity. Failure of one machine is absorbed naturally if the architecture allows it; the same redundancy that buys reliability buys scalability.
+- *Cons.* Distributed-systems complexity in full. Sharding stateful workloads is hard. Network turns from a free resource into the dominant latency budget — 0.5 ms within a rack, 1–10 ms across an availability zone, 50–150 ms cross-region. Coordination overhead grows with N (the rest of §3.6 is about exactly this). Operational and observability burdens scale with the number of nodes.
+
+The technical core of horizontal scaling has a name: **shared-nothing**. Each node owns its CPU, memory, and disk; there is no shared state, only message passing. The opposing patterns — shared-disk (Oracle RAC and similar) and shared-memory (NUMA, single-machine) — eventually contend on the shared resource and stop scaling. Every system that earned the *"web-scale"* label — Cassandra, DynamoDB, Spanner, Kafka, Elasticsearch, S3 — is shared-nothing. The real meaning of *horizontal* is not "more boxes" but "no shared state."
+
+In production, almost no one runs pure vertical or pure horizontal. The common shape is **diagonal**: each node is moderately powerful, and there are several of them. A capacity step usually means *upsize the node and add nodes at the same time*, balancing per-node strength against fleet redundancy.
+
+The transition from vertical-first to horizontal has two failure modes. *Premature horizontal* — going distributed on day one to "be ready for scale" — pays the full cost of distribution before there is any benefit. *Late horizontal* — staying on a single node until it tips over — leaves no time to migrate. The realistic pattern is to track utilization against the largest available instance: at ~50% you should be planning the horizontal architecture, at ~80% the migration should already be under way.
+
+| Criterion | Vertical wins | Horizontal wins |
+|---|---|---|
+| Architectural change required | ✓ none | ✗ significant |
+| Latency-sensitive in-process work | ✓ | ✗ |
+| Reliability / fault tolerance | ✗ SPOF | ✓ natural redundancy |
+| Headroom for growth | ✗ ceiling | ✓ unbounded |
+| State management ergonomics | ✓ ACID free | ✗ distributed problem |
+| Cost at large scale | ✗ super-linear | ✓ roughly linear |
+| Cost at small scale | ✓ | ✗ coordination overhead wasted |
+| Speed of development (early stage) | ✓ | ✗ |
+
+### Stateless design — the prerequisite for horizontal scaling
+
+If shared-nothing is the rule of the architecture, **stateless** is the rule of the request-handling tier inside it. The two are versions of the same idea applied at different layers.
+
+A stateless service is one in which any node can handle any request and produce the same result. *Stateless* does not mean *no memory*; it means *no node-local memory that the next request depends on*. The state of the system still exists somewhere — in the database, in a cache, in the client's token — but never inside the request-handling node's process.
+
+There are two kinds of state to think about:
+
+- **Persistent state.** User accounts, orders, messages — already in the database. Not the issue.
+- **Session / transient state.** Login session, multi-step form progress, an open WebSocket, a per-user rate-limit counter. This is where the architectural decision sits.
+
+Three places that session state can live:
+
+- **On the client.** JWT, signed cookie, mobile app state. The server validates the token on every request and holds nothing locally. Server is fully stateless. Cost is zero. Drawbacks: token size grows on every request; revocation requires a server-side blacklist (and brings state back); sensitive data cannot ride on the client.
+- **In a shared store.** Redis or Memcached, keyed by session ID. The server is still stateless; it dereferences the session at the start of every request. Drawbacks: an extra network hop on every request, and the store itself is a new dependency that needs its own reliability design.
+- **Sticky to a node.** The load balancer routes a user's traffic always to the same node, which keeps state in its own process memory. This is an anti-pattern — it preserves the legacy code at the cost of making the system fragile. Load distribution is uneven (a heavy user always hits the same node), node death loses the session, deploys require draining, and adding nodes does not rebalance existing users.
+
+The widely-cited industry doctrine on this is **The Twelve-Factor App** (Heroku, 2011), specifically Factor VI:
+
+> *Execute the app as one or more stateless processes. Sticky sessions are a violation.*
+
+Cloud-native runtimes — Kubernetes, ECS, Cloud Run, Heroku — all assume this factor. Pushing state to backing services is the default; sticky sessions are a workaround for legacy systems that cannot afford the rewrite.
+
+The pragmatic test of statelessness is operational, not architectural: *if you kill any node and bring up an identically-configured replacement, does the system behave the same?* In SRE shorthand the test is **"cattle, not pets"** — nodes that are interchangeable, replaceable, and never named.
+
+#### In-memory cache — the soft violation
+
+The most common compromise is the in-memory cache. The service caches DB query results in its own process to skip a round trip. Strictly speaking the service is no longer stateless; in practice this is acceptable, with conditions:
+
+- Losing the cache must not affect correctness — re-fetching from the DB must still produce the right answer.
+- Cache misses on a fresh node must not catastrophically slow the system.
+- Hot keys cached in N processes mean N copies of the same data; cache effectiveness is much lower than a shared cache would deliver.
+- Invalidation across N nodes is hard, and TTL-only invalidation is the path of least resistance.
+
+For this reason serious systems treat in-memory cache as *L1*, with a shared distributed cache (Redis, Memcached) as *L2*, and the database as the final source of truth. Chapter 5 covers this stack in detail.
+
+#### Where stateless is hard
+
+Some workloads are stateful by their nature, and the right move is to isolate them in their own tier rather than fight to make them stateless.
+
+- **WebSocket / long-lived connections.** The TCP socket physically lives on a node. Either accept stickiness for the connection itself, or split the architecture: a stateless application tier behind a stateful gateway tier whose only job is holding connections (the Slack gateway architecture is a public reference).
+- **Real-time game servers.** Tens of thousands of state mutations per second per match make per-tick database writes infeasible. Players are partitioned to match servers; each match server holds its match's state in RAM. Stickiness is the design, not the failure mode.
+- **Streaming and transcoding pipelines.** The half-encoded frame buffer must live somewhere; recovery is via checkpointing, not statelessness.
+- **The database itself.** The hardest stateful workload, and the topic of chapters 6 (consistency and consensus) and 7 (storage).
+
+Where state must be kept *and* the service must scale horizontally, the technique is **partition + replicate + coordinate**: shard the state across N nodes (horizontal capacity), replicate each shard to K nodes (reliability and read scale), and use a consensus protocol to decide who owns what. All three are heavy enough to deserve their own chapters; they are introduced here because they are how the stateful tier follows the rules of horizontal scaling without giving up its state.
+
+### Percentile thinking — performance is not measured by averages
+
+Latency distributions are skewed to the right. The left side is bounded at zero; the right side is unbounded. The mean sits well above the median, and a single user's experience is not the mean — it is the latency of *that user's specific requests*. Reporting performance as a mean is, in almost every public-facing system, wrong.
+
+Two systems can share a mean of 50 ms and feel completely different. One has p50=50, p95=70, p99=90 — narrow distribution, every user has a similar experience. The other has p50=30, p95=200, p99=1500 — same average, but every hundredth user waits 1.5 seconds and every thousandth waits much longer. Mean does not distinguish these systems; percentiles do.
+
+The vocabulary is:
+
+- **p50 (median)** — the typical experience.
+- **p95** — most user-perceived performance lives here. The slowest 5% are still close.
+- **p99** — where complaints start. At 1k QPS this is one user per second.
+- **p999, p9999** — the deep tail. Critical for high-throughput services.
+
+The general rule: mean is *not* typical; mean always sits above the median; the median answers *"how does my system feel"* and the high percentiles answer *"how does it fail."*
+
+The sectoral conviction about percentiles came from two findings. Amazon (2007) reported that a 100 ms increase in *p99 latency* — with mean unchanged — cost roughly 1% of sales. Google's *Tail at Scale* paper (Dean and Barroso, 2013) showed that a single request fanning out to N internal services inherits the worst of each: if every backend has 1% probability of being slow, the probability that *some* backend is slow on a 100-way fan-out is around 63%. The p99 of one backend becomes the p50 of the user-visible latency. *In a fan-out architecture, tail latency does not stay in the tail.*
+
+Mitigations are about doing extra work to shorten the tail:
+
+- **Hedged requests** — issue the same request to two replicas, take the first answer. ~2× backend cost, dramatically tighter tail.
+- **Tied requests** — start the second request, and have the first replica cancel it as soon as it begins responding.
+- **Backup-after-delay** — wait N ms; if no response, fire a second request.
+- **Outlier eviction** — load balancers (Envoy is a canonical implementation) drop replicas whose p99 has drifted away from the fleet.
+
+There is also a less-discussed statistical fact: *heavy users live in the tail*. The maximum latency a user has experienced over their N requests rises with N. A user with 10 requests experiences roughly the system's p90 as their worst; a user with 1,000 requests experiences roughly the p999. The users at the system's worst percentile are disproportionately the heaviest users — usually the most valuable ones. Caring about p99 is not just statistical hygiene; it is caring about the specific users who matter most.
+
+A widespread hidden bias in latency measurement is **coordinated omission**, named by Gil Tene. Most benchmark loops measure response time only for requests they actually managed to send. When the system stalls, the benchmark stalls with it, and the missed requests are never recorded. The histogram reports one bad sample where there should have been thousands. Tools that handle this correctly — HdrHistogram, wrk2, Tene's own libraries — measure *intended send time* rather than *actual send time*. p99 numbers from older tools (`ab`, early `jmeter`) are routinely 5–10× more optimistic than reality. When reading a percentile number, ask whether the measurement corrected for coordinated omission.
+
+Two further pitfalls in working with percentiles:
+
+- **Percentiles do not add.** *p99(A→B)* is not *p99(A) + p99(B)* — the slow request through A is usually a different request from the slow request through B. To get end-to-end percentiles, trace each individual request and compute the distribution of the totals.
+- **Percentiles do not average.** *"Each of 10 nodes has p99 = 100 ms, so the cluster p99 is 100 ms"* is wrong. Percentiles are properties of distributions; you need a central histogram (HdrHistogram, t-digest) to compute the cluster's p99 from the per-node histograms. Modern monitoring stacks do this; older "average across hosts" dashboards do not.
+
+The dialect of operational reliability — SLI, SLO, error budgets (§8) — is written entirely in percentiles for these reasons. *Mean* SLOs are vanishingly rare in modern practice.
+
+### The laws of parallel scaling — Amdahl, Gustafson, USL
+
+Every act of horizontal scaling is bounded by two laws. **Amdahl's Law** (1967) says that the speedup achievable by parallelism is capped by the serial fraction of the work — adding cores cannot speed up code that has to run on one core. **Universal Scalability Law** (Gunther, 1993) extends Amdahl by adding a coordination cost: past a certain N, adding nodes makes the system *slower*, because the cost of keeping them in sync outgrows the work they contribute. The corollary that runs through this entire handbook — *eliminate serial fractions, eliminate coordination, partition* — is a direct consequence.
+
+The full math, the formulas, the shape of the curves, and the implications for shared-nothing architecture, eventual consistency, and consensus protocols are treated as a standalone reference: see [scalability-laws.md](./scalability-laws.md).
+
+The three takeaways to carry into the rest of the handbook:
+
+1. **Linear scaling does not exist.** Some serial fraction always remains; the maximum speedup is `1/s`, regardless of how many machines you add.
+2. **Beyond a point, more nodes are *worse*.** Coordination cost rises with N²; the optimum cluster size N\* is usually smaller than the team estimated.
+3. **The only general antidote is partition.** Splitting global state into K independent shards effectively divides the coordination cost by K, raising the scaling ceiling by the same factor.
+
+### What §3 covers, what §3 doesn't
+
+§3 is the conceptual layer of scalability — what it means, what to measure, what to scale on, and the laws that bound the answer. The mechanical layers that actually deliver scalability — the protocols, data structures, and operational practices — are spread across the rest of the handbook:
+
+| Layer | Where in the handbook |
+|---|---|
+| Networking, traffic shaping, load balancers | Chapter 2 |
+| Sharding, replication, consistency models | Chapter 3 (data) + chapter 6 (consensus) |
+| Communication patterns (sync, async, queues, streams) | Chapter 4 |
+| Caching tiers and invalidation | Chapter 5 |
+| Storage scalability — partitioning, compaction, hot tiers | Chapter 7 |
+| Search-specific scaling — indexes, sharded search | Chapter 8 |
+| Capacity planning, autoscaling, deployment topology | §6 of this chapter + chapter 9 |
+| Reliability under load — backpressure, load shedding, circuit breakers | Chapter 10 |
+| Tail-latency mitigation as an operational practice | Chapter 10 + chapter 11 |
+
+§3 teaches the language. The rest of the handbook teaches the techniques.
+
+### §3 recap
+
+In one sentence: **scalability is a system's response to growth along a specified load axis, bounded by the serial fraction of the work and the cost of coordination.**
+
+The five anchors:
+
+1. **"Scalable" is not a claim** — name the load parameter, the from-value, the to-value, the time horizon, and the cost. Otherwise the word is marketing.
+2. **Load is a distribution, not a number** — the mean lies; the tail of the distribution is where systems break (hot keys, celebrities).
+3. **Vertical and horizontal both have a place; diagonal usually wins** — the real meaning of horizontal is *shared-nothing*, not *more boxes*.
+4. **Stateless is the prerequisite of horizontal scaling** — push state to the client, to a shared store, or to a stateful tier with its own design; sticky sessions are a legacy compromise.
+5. **Mean lies about latency too** — performance is a percentile dialect; the tail amplifies under fan-out, and coordinated omission silently understates it.
+
+The sentence to keep at the top of any scalability discussion:
+
+> *No system is scalable in general. A system is scalable along a particular axis, up to a particular target, within a particular budget — and only after the serial fraction and the coordination cost have been measured.*
+
+---
+
 ## Next
 
-- §3 — Scalability deep dive
 - §4 — Maintainability deep dive
 - §5 — Back-of-envelope estimation
 - §6 — Capacity planning ritual
