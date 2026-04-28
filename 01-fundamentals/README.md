@@ -941,9 +941,230 @@ The sentence to keep at the top of any maintainability discussion:
 
 ---
 
+## 5. Back-of-envelope estimation
+
+§3 and §4 kept returning to the same point: design decisions are choices about *which order of magnitude the system will encounter*, not choices about which tool sounds clever. *"Should we cache this?"* is a numbers question — DB hit ~5 ms, cache hit ~50 µs, the cache wins by 100×. *"Cross-region replication?"* is a numbers question — round-trip 150 ms, p99 SLO 200 ms, sync replication is dead on arrival. *"Kafka or Postgres?"* is a numbers question — 50k events/s × 1 KB each is the calculation that decides.
+
+An engineer who cannot run these numbers in their head does not have design intuition. The interview is scored on the same numbers; the daily job demands them if you do not want to spend a sprint on a wrong choice.
+
+The good news: the list to memorize is small — about 15–20 lines. The better news: the numbers are useful at **order-of-magnitude precision**. *"Is this 100 ns or 80 ns"* does not matter; *"is it 100 ns, 100 µs, or 100 ms"* does — that is the 1000× decision. Engineering runs on this resolution; physics does not get a say.
+
+This section walks the three sets of numbers that recur in capacity work — latency, throughput, and storage — plus the powers-of-two and time conversions that bind them, and the Fermi discipline that keeps results within useful tolerance. The full reference tables (more systems, more hardware, more scenarios) live alongside in [back-of-envelope-numbers.md](./back-of-envelope-numbers.md).
+
+### Jeff Dean's table — the canonical reference
+
+In 2009 Jeff Dean (one of Google's lead architects, behind MapReduce, BigTable, and Spanner) gave a Stanford talk: *"Designs, Lessons and Advice from Building Large Distributed Systems."* One slide held a small list — *"Numbers Everyone Should Know."* The list circulated and is now referenced across the industry as *"the Jeff Dean numbers."*
+
+The classic table (with 2012 updates — some lines have improved with newer hardware):
+
+| Operation | Time | As a multiple |
+|---|---|---|
+| L1 cache reference | 0.5 ns | — |
+| Branch mispredict | 5 ns | 10× L1 |
+| L2 cache reference | 7 ns | 14× L1 |
+| Mutex lock/unlock | 25 ns | 50× L1 |
+| **Main memory (DRAM) reference** | **100 ns** | **200× L1** |
+| Compress 1 KB (Snappy) | 3 µs | 30× DRAM |
+| Send 1 KB over 1 Gbps network | 10 µs | 100× DRAM |
+| **Read 4 KB random from SSD** | **150 µs** | **1,500× DRAM** |
+| Read 1 MB sequentially from RAM | 250 µs | 2,500× DRAM |
+| **Round-trip within same datacenter** | **500 µs** | **5,000× DRAM** |
+| Read 1 MB sequentially from SSD | 1 ms | 10,000× DRAM |
+| **Disk seek (HDD)** | **10 ms** | **100,000× DRAM** |
+| Read 1 MB sequentially from HDD | 30 ms | 300,000× DRAM |
+| **Round-trip cross-continent (CA ↔ Netherlands)** | **150 ms** | **1,500,000× DRAM** |
+
+The bold lines are the ones referenced in daily practice; the rest provide the ladder that lets the bold lines be reasoned about.
+
+### Reading the table — the "two-orders-of-magnitude ladder"
+
+The right way to learn the table is not line by line. The right way is to recognize **the ladder of tiers**, each tier roughly 100× the previous:
+
+```
+Tier 1   ~1 ns       inside the CPU (cache, register, branch)
+Tier 2   ~100 ns     RAM (DRAM access)
+Tier 3   ~10 µs      fast local I/O (network within rack, SSD random)
+Tier 4   ~1 ms       slower local I/O (1 MB transfer, SSD sequential)
+Tier 5   ~10 ms      HDD seek (mechanical disk)
+Tier 6   ~100 ms     cross-region network (intercontinental)
+```
+
+The engineering instinct reduces to one sentence: **"if I move this operation from tier X to tier Y, what is the multiplier?"**
+
+- Cache vs DB → tier 2 vs tier 3 → ~100× faster. Caching is usually justified.
+- Local DC vs cross-region → tier 3 vs tier 6 → ~300,000× slower. This is why multi-region replication is *"hard."*
+- HDD vs SSD random read → tier 5 vs tier 3 → ~70× faster. The reason SSDs paid for themselves.
+- DRAM vs disk → tier 2 vs tier 5 → ~100,000× slower. The reason behind the *"working set must fit in RAM"* rule.
+
+If the exact numbers slip away, the ladder still gives the answer: *"cross-region cache sync sits around 100 ms, ~100,000× slower than local — sync replication is unworkable."*
+
+### Three numbers that force pause
+
+Three facts the average mental model gets wrong:
+
+1. **Network is not free.** The intuition is often *"a network call costs almost nothing."* In reality a local datacenter round-trip is ~500 µs — 5,000× slower than RAM. The full bill of *"every interaction is an RPC"* microservice designs is paid here.
+2. **Sequential disk is fast; random disk is brutal.** Even SSD reads at ~3 GB/s sequentially but throttles under random 4 KB IOPS. On HDD the gap is 1,000×. Database design (LSM trees, log-structured storage) is fanatical about sequential writes for exactly this reason.
+3. **Cross-region 150 ms = "you can't."** The number is not below 150 ms — it is physics. Light through fiber covers ~5,000 km in ~25 ms one-way; intercontinental round-trip plus router overhead lands around 150 ms. Sync replication across regions means accepting that latency on every write; no production user accepts it. Multi-region systems run async, with eventual consistency — physics decided, architecture followed.
+
+### Has the list aged?
+
+A frequent question. Short answer: **the orders of magnitude are unchanged; some absolute numbers improved.**
+
+- **DRAM** ~100 ns — unchanged. Sits near a physical limit (capacitor row activation); no measurable jump in 15 years.
+- **SSD random read** was ~150 µs in 2009; modern NVMe drops to ~20–50 µs. Still ~200× slower than DRAM.
+- **Network within DC** can drop below 100 µs with RDMA and modern NICs in some environments, but "typical" is still around 500 µs.
+- **Cross-region** unchanged — physics (light speed) is fixed. New fiber does not help; latency tracks distance.
+- **HDD seek** unchanged (~10 ms) because it is mechanical. Most production environments no longer touch HDD; HDD is for cold data and backups now.
+
+These numbers will be measured again in five years; most lines will not move, because physics has not.
+
+### Throughput numbers — *"how much per second"*
+
+Latency answers *"how long does one operation take."* Throughput answers *"how many can be done per unit time."* Half of capacity decisions hinge on throughput — *"can one node carry this, or do I need to shard?"*
+
+| System | Typical throughput | Notes |
+|---|---|---|
+| Single HTTP server (modest JSON API) | **~10k QPS** | Synchronous, small payload. Async I/O reaches 50k+. |
+| Single Postgres — read | **~10–50k QPS** | Indexed point reads. Aggregations or scans much lower. |
+| Single Postgres — write | **~5–10k QPS** | Bounded by WAL fsync. Batch + group commit reaches 50k+. |
+| Single Redis | **~100k QPS** | Single-threaded, in-memory; pipelining reaches 1M+. |
+| Single Kafka broker | **~100 MB/s sustained** | Sequential disk write limit. |
+| Single Cassandra node — write | **~10k/s** | LSM tree, sequential-write friendly. |
+| Single Elasticsearch node — index | **~5k doc/s** | Indexing is CPU-bound; query throughput separate. |
+| Load balancer (HAProxy / Envoy) — L7 | **~50k+ QPS** | Varies with connection count. |
+| Load balancer — L4 | **~500k+ QPS** | Less work; much higher. |
+
+Hardware tier:
+
+| Hardware | Typical throughput | Notes |
+|---|---|---|
+| SATA SSD — sequential | **~500 MB/s** | Bus and controller limited. |
+| NVMe SSD — sequential | **~3–7 GB/s** | PCIe 4.0; PCIe 5.0 reaches ~12 GB/s. |
+| NVMe SSD — random 4 KB | **~100k IOPS** | NAND access; ~10× fewer bytes/s than sequential. |
+| HDD — sequential | **~150 MB/s** | Mechanical; not changed much. |
+| HDD — random | **~100 IOPS** | Bounded by seek time. |
+| 1 Gbps NIC | **~125 MB/s** | Practical upper bound. |
+| 10 Gbps NIC | **~1.25 GB/s** | Modern datacenter standard. |
+
+The full per-system and per-hardware tables are in [back-of-envelope-numbers.md](./back-of-envelope-numbers.md).
+
+**How to read these tables.** The numbers are **rough** and depend on CPU, disk, schema, and workload. The use is decisional, not contractual: *"my estimate says 100k write/s — a single Postgres will not carry it; I need sharding or a different engine."* Even if the rough number is off by 1×, the decision usually does not change.
+
+**Two intuition-breakers:**
+
+- **In-memory systems are 10–100× faster.** The Redis vs Postgres gap alone explains the popularity of cache architectures. The slogan *"cache anything you can cache"* lives on this number.
+- **Sequential vs random gap is enormous.** The same SSD does ~3 GB/s sequentially, ~400 MB/s on random 4 KB reads — almost a tenfold gap. On HDD the gap is 1,000×. Hence the universal preference in storage engines for *append-only logs*, *LSM trees*, and *write-ahead logs*: all exist to keep disk access sequential.
+
+### Storage and size numbers — typical object sizes
+
+The other half of capacity planning: *"how much disk does this much data occupy?"* This requires knowing how big a single object typically is.
+
+| Object | Typical size | Notes |
+|---|---|---|
+| UUID (binary) | 16 B | Identifier accounting. |
+| Tweet (text) | ~200 B | 280 characters plus metadata; serialized payload larger. |
+| Typical JSON API record | 1–5 KB | User profile, post, order, etc. |
+| Single structured log line | 200 B – 1 KB | JSON / logfmt; raw text smaller. |
+| Thumbnail JPEG (200×200) | 10–30 KB | — |
+| Typical web image (1080p JPEG) | 200–500 KB | — |
+| Smartphone photo (12 MP, JPEG) | 2–4 MB | RAW: 20–40 MB. |
+| 1 minute 1080p video (H.264) | ~50 MB | Bitrate ~6 Mbps. |
+| 1 minute 4K video (H.265) | ~250 MB | Bitrate ~30 Mbps. |
+| Postgres row overhead | ~24 B | Header + null bitmap; per-row added cost. |
+
+Capacity formula:
+
+```
+total_storage = N_objects × avg_size × replication_factor × overhead_multiplier
+
+  - N_objects     : DAU (Daily Active Users) or total, whichever you are counting
+  - avg_size      : the matching row from the table above
+  - replication   : 3× (classic), 2× (cost-sensitive), 6× (mission-critical)
+  - overhead      : 1.5–2× for indexes / metadata
+```
+
+A typical example: *"100M users, 50 posts per user, 1 KB average per post, 3× replication, 1.5× overhead"* → 100M × 50 × 1 KB × 3 × 1.5 = **22.5 TB**. Fits on one SSD; if you reach for sharding, the justification has to come from a different axis.
+
+### Powers-of-two cheat sheet
+
+All of the above arithmetic crosses between *power-of-two* and decimal. Equivalences worth knowing by heart:
+
+| Power of 2 | Approx decimal | Name |
+|---|---|---|
+| 2¹⁰ | 10³ (thousand) | KB |
+| 2²⁰ | 10⁶ (million) | MB |
+| 2³⁰ | 10⁹ (billion) | GB |
+| 2⁴⁰ | 10¹² (trillion) | TB |
+| 2⁵⁰ | 10¹⁵ | PB |
+| 2⁶⁰ | 10¹⁸ | EB |
+
+Every 10 bits ≈ 3 decimal digits (×1024 ≈ ×1000). The approximation is intentional — the real gap is 1024 / 1000 = 1.024, about 2.4%. Back-of-envelope work ignores it. Where precision matters (vendor disk *"1 TB = 10¹² bytes"*, OS *"1 TiB = 2⁴⁰ bytes"* — IEC notation), it is called out explicitly.
+
+**Time conversions** — capacity calculations usually need *"X events per second"* → *"per day / per year"*:
+
+| Window | Seconds |
+|---|---|
+| 1 minute | 60 |
+| 1 hour | 3,600 (~3.6K) |
+| 1 day | 86,400 (~10⁵) |
+| 1 month (30 days) | 2.6M |
+| 1 year | 31.5M (~3 × 10⁷) |
+
+Practical mnemonic: **1 year ≈ π × 10⁷ seconds** (3.14 × 10⁷ ≈ 31.4M, actual 31.5M — a quirky coincidence that keeps mental math fast).
+
+A quick application: *"100 events per second — how many in a year?"* → 100 × 3 × 10⁷ = **3 × 10⁹ ≈ 3 billion**. *"At 1 KB each, total data?"* → 3 × 10⁹ × 10³ B = **3 TB / year**.
+
+### Order-of-magnitude thinking — the Fermi discipline
+
+Engineering arithmetic is not about avoiding 1.2× errors; it is about avoiding **10× errors**. *"50k QPS"* (Queries Per Second) vs *"47k QPS"* never changes a decision; *"50k"* vs *"500k"* changes the **architecture**. Hence the discipline: *"approximately right beats precisely wrong"* — the spirit of Enrico Fermi's atomic-test estimate (*"how far does this scrap of paper fly when the bomb goes off"*).
+
+Three working rules:
+
+1. **Round, then multiply.** You are not computing 7,234 × 412 in your head. 7K × 0.4K = 2.8M is enough. Error margin 5–10%, easily inside decision tolerance.
+2. **Be precise enough to keep the order.** 100K QPS *vs* 1M QPS — that gap moves architecture. 100K *vs* 50K — moves node count, but not architecture.
+3. **Sanity-check.** *"Math says I need 10 GB/s"* — then remember 10 GB/s is 80 Gbps, that exceeds a 10 Gbps NIC, and walk back to *"is this estimate right?"* Half of Fermi discipline is asking *"is this even plausible?"* on every result.
+
+### *"Why these numbers"* — a brief physics primer
+
+Three physical facts behind the table. Depth belongs to computer organization and networking textbooks; the goal here is to anchor the numbers to reasoning rather than memory:
+
+- **DRAM ~100 ns.** DRAM stores each bit in a capacitor. A read involves *row activate* (capacitor charge driven onto the bitline), sense amplifier, *row buffer* load, and column select. The chain sums to nanoseconds; dropping below ~50–100 ns requires a different physical technology (HBM, persistent memory). CPU caches (~1 ns) are faster because they are **SRAM** — flip-flop based, much faster but much more expensive per byte.
+- **Cross-region ~150 ms RTT.** Light in fiber moves at ~65% of vacuum speed (refractive index ~1.5). US east-to-west is ~5,000 km → ~25 ms one-way. Europe ↔ US is ~8,000 km → ~40 ms one-way. Round-trip plus router/switch jitter and minor overhead lands at 100–150 ms. **This number does not improve** — laying new fiber does not help unless distance shrinks. The argument for edge computing is to cross *under* this number by *bringing the computation to the user.*
+- **HDD seek ~10 ms.** Mechanical. A 7,200 rpm disk completes one rotation in 8.3 ms → average rotational latency is half of that ≈ 4.2 ms. On top, the head moves to the right track (seek time) ≈ 5 ms. Total ≈ 10 ms. This number has not improved in 30 years — physical motor speed is the ceiling. The reason SSDs displaced HDDs in production is essentially this one number.
+
+For the interested:
+
+- Brendan Gregg, *Systems Performance* (2020, 2nd ed) — the canonical hardware-and-OS performance reference.
+- Colin Scott's interactive *"Latency Numbers Every Programmer Should Know"* — Jeff Dean's table, kept up to date by year.
+
+### What §5 covers, what §5 doesn't
+
+§5 is the *vocabulary* of estimation — three sets of numbers, the powers-of-two and time conversions that connect them, and the Fermi discipline that keeps results within useful tolerance.
+
+The full reference tables — the lines for systems and hardware not in the README's summary tables — live in [back-of-envelope-numbers.md](./back-of-envelope-numbers.md). Use the README to learn the structure; use the supplementary file as the lookup sheet for case-study work and capacity calculations.
+
+The *application* of these numbers — turning *"100M DAU"* into *"peak QPS, peak bandwidth, total storage, hot-set size, working set"* — is §6's subject. §5 teaches the alphabet; §6 teaches the sentences.
+
+### §5 recap
+
+In one sentence: **back-of-envelope estimation is the discipline of binding engineering intuition to numbers — at order-of-magnitude precision, in the head, in 30 seconds.**
+
+Three sets of numbers, all worth memorizing:
+
+1. **Latency hierarchy** — five tiers (cache → DRAM → local I/O → disk → cross-region), each tier ~100× the last. Decision: *"which tier does this operation belong on?"*
+2. **Throughput numbers** — single-node ceilings (~10k HTTP QPS, ~50k Postgres read QPS, ~100k Redis QPS, ~100 MB/s Kafka). Decision: *"will one node carry it, or do I shard?"*
+3. **Storage / size numbers** — typical object size × N × replication × overhead = total disk. Decision: *"which storage tier (SSD / HDD / object store), how many nodes?"*
+
+Helpers: powers-of-two (2¹⁰ ≈ 10³), time conversions (1 year ≈ π × 10⁷ s), and Fermi discipline (round → multiply → sanity check).
+
+The sentence to keep at the top of any estimation:
+
+> *Approximate is fine. Off by an order of magnitude is not. The discipline is to know which is which.*
+
+---
+
 ## Next
 
-- §5 — Back-of-envelope estimation
 - §6 — Capacity planning ritual
 - §7 — Mental models
 - §8 — SLI / SLO / SLA and error budgets
