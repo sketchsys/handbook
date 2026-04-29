@@ -1377,9 +1377,239 @@ Bind the answers to a cadence — quarterly, pre-launch, post-incident — and t
 
 ---
 
+## 7. Mental models
+
+§5 gave the alphabet — back-of-envelope numbers. §6 gave the loop — the capacity ritual. §7 gives the *lenses*: the mental shapes that turn a system diagram into the right *questions*. A lens does not produce an answer. It forces a particular question to be asked, and reveals which side of a tradeoff the system has chosen.
+
+Mental models earn their place in three ways:
+
+- They give a checklist to enter any case study with.
+- They keep tradeoffs from being forgotten under interview pressure.
+- They produce, fast, the sentence *"this system is strong here, weak there."*
+
+Four categories: **trade-off, architectural, failure, organizational.**
+
+### A. Trade-off lenses
+
+#### A.1 CAP theorem
+
+Brewer, 2000. A distributed system, **during a network partition**, can hold at most two of:
+
+- **C** — Consistency: every read returns the most recent write
+- **A** — Availability: every request gets a response
+- **P** — Partition tolerance: the system continues despite a partition
+
+Partitions are inevitable in real systems, so P is given; the choice is **C vs A**. Systems are labeled **CP** (Spanner, etcd, ZooKeeper) or **AP** (Cassandra, DynamoDB, Riak). "CA" is shorthand for *"I have not designed for partitions."*
+
+**Why the lens matters:** it forces the question *"what does this system do during a partition?"* Either it serves stale data (AP) or it returns errors (CP). Neither is wrong — the answer depends on the use-case (banking → CP; shopping cart → AP).
+
+**Trap:** CAP only describes behavior during a partition. It says nothing about normal-operation behavior. That gap is closed by PACELC.
+
+#### A.2 PACELC
+
+Abadi, 2010. The mature form of CAP:
+
+- **P**artition: choose **A** vs **C**
+- **E**lse: choose **L**atency vs **C**onsistency
+
+A system carries a tradeoff in *normal* operation too. Synchronous replication gives strong consistency at the cost of latency; asynchronous replication gives low latency at the risk of stale reads.
+
+| Class | Examples |
+|---|---|
+| **PA/EL** | Cassandra, DynamoDB (default reads) |
+| **PC/EC** | Spanner, FoundationDB |
+| **PA/EC** | DynamoDB strong-consistent reads |
+
+**Why the lens matters:** *"What's the system's full PACELC class?"* is sharper than *"is it CP or AP?"* CAP is the entry; PACELC is the working tool.
+
+#### A.3 Latency vs throughput
+
+Two independent readings of the same capacity:
+
+- **Latency** — time for *one* request to complete
+- **Throughput** — requests completed per unit time
+
+They do not improve together. Batching raises throughput at the cost of per-item latency. Stream processing lowers latency at the cost of throughput per node.
+
+**Why the lens matters:** *"Is this operation latency-sensitive or throughput-sensitive?"* drives the architecture. The user-facing path is latency-sensitive; the analytics path is throughput-sensitive — the same data flows through two different systems.
+
+#### A.4 Consistency spectrum
+
+Strong vs eventual is not a binary; it is a gradient:
+
+| Level | Guarantee |
+|---|---|
+| Linearizable | Behaves as if there is one node |
+| Sequential | All nodes see the same order |
+| Causal | Causally-related writes preserve order |
+| Read-your-writes | A user reads their own writes |
+| Monotonic reads | Reads do not go backwards in time |
+| Eventual | Given enough time, everyone agrees |
+
+**Why the lens matters:** *"Which level is enough?"* A bank balance demands linearizable; a social-media like counter is content with eventual. Stronger consistency is more expensive and slower — pay for what is needed, not more.
+
+### B. Architectural lenses
+
+#### B.1 Push vs pull
+
+Where is the initiative?
+
+- **Push** — producer sends when ready (webhooks, server-sent events, Kafka producer→broker)
+- **Pull** — consumer asks when ready (polling, Kafka consumer→broker, Prometheus scrape)
+
+Push gives low latency but demands backpressure; pull gives consumer control at the cost of overhead and delay.
+
+**Why the lens matters:** notifications are push (instant); metrics scrape is pull (Prometheus model); email is pull (the client fetches). Naming the choice forces awareness of why it was made.
+
+#### B.2 Sync vs async
+
+Does the caller wait?
+
+- **Sync** — caller blocks until response; simple, easy to debug
+- **Async** — caller dispatches and continues; response delivered via callback, queue, or future
+
+Sync↔async is *orthogonal* to push↔pull. HTTP request/response is a sync push. A webhook is an async push. A blocking poll is a sync pull. A queue consumer is an async pull.
+
+**Why the lens matters:** *"Is the user waiting on this call?"* If yes, sync fast path; if no, async + queue. Over-sync produces cascading failure; over-async produces debugging hell.
+
+#### B.3 Stateful vs stateless
+
+Does the server hold session/data between requests?
+
+- **Stateless** — every request is self-contained; any node serves the same answer
+- **Stateful** — the server keeps history (session, connection, in-process cache)
+
+Covered in §3 as the prerequisite for horizontal scaling. As a lens: *push state outside* — to a database, cache, or client. State-bearing nodes are hard to scale, lose data on restart, and demand sticky routing.
+
+**Why the lens matters:** *"Is this component stateful? Does it need to be?"* If yes (database, cache, queue), its scaling story is fundamentally different.
+
+#### B.4 Read path vs write path
+
+The same data has two paths through the system, and they are rarely symmetric:
+
+- **Read path** — cache → replica → primary
+- **Write path** — validate → primary → cache invalidate → replicate → fan-out
+
+They are asymmetric because reads outnumber writes 10–100×, reads tolerate staleness, and writes demand atomicity.
+
+**Why the lens matters:** once *"write-heavy or read-heavy?"* is answered, the system is drawn as **two systems**. The Twitter timeline is canonical: fan-out-on-write (the Bieber problem — one celebrity tweet pushes to millions) versus fan-out-on-read (the Kim Kardashian problem — millions of followers pulling on demand) — same feature, different architectures.
+
+### C. Failure lenses
+
+#### C.1 Idempotency
+
+An operation is **idempotent** if calling it N times with the same input has the same effect as calling it once.
+
+- `SET balance = 100` → idempotent
+- `INCREMENT balance BY 100` → not idempotent
+- `DELETE WHERE id=42` → idempotent (second call is a no-op)
+- `INSERT INTO orders VALUES (...)` → not idempotent
+
+In a distributed system, retries are unavoidable (timeouts, partial failures, dropped responses). Idempotency makes retries *safe*.
+
+**Why the lens matters:** *"Can I make this call idempotent? If not, can I attach an idempotency key + dedup table?"* Stripe, AWS, Square — every modern API supports idempotency keys. Idempotency is the smallest safe building block in distributed systems.
+
+#### C.2 Delivery semantics
+
+How many times does a message get through?
+
+- **At-most-once** — delivered zero or one times. Messages can be lost; no duplicates. (UDP, fire-and-forget.)
+- **At-least-once** — delivered at least one time. Duplicates possible. (Kafka default, SQS.)
+- **Exactly-once** — delivered exactly once. *No pure form exists in distributed delivery* — it is produced by combining at-least-once delivery with idempotent consumers.
+
+**The motto:** *exactly-once **delivery** does not exist; exactly-once **processing** does — at-least-once delivery + idempotent consumer.* For money movement and similar, the transactional outbox pattern wires the two together.
+
+#### C.3 Failure domains and blast radius
+
+- **Failure domain** — the boundary of things that die together (rack, AZ, region, account, deployment unit)
+- **Blast radius** — the area affected when something fails
+
+| Architecture | Failure domains | Blast radius |
+|---|---|---|
+| Single DB | 1 | the entire system |
+| Multi-AZ replicas | 3 | one third of traffic |
+| Cell-based (Slack, AWS) | many cells | one cell's customers |
+
+**Why the lens matters:** *"What goes down when this dies?"* If the answer is "everything," isolation (bulkhead, cell, sharding) is the next architectural move.
+
+#### C.4 Backpressure
+
+What happens when production exceeds consumption?
+
+- The buffer fills, then bursts
+- A "slow down" signal travels back to the producer (TCP flow control, gRPC streaming, Reactive Streams)
+- Load is shed
+
+A pipeline without backpressure produces **runaway queues** and **cascading failure**: fast producer + slow consumer → queue grows → memory pressure → consumer slows further → queue grows more → collapse.
+
+**Why the lens matters:** *"Is there backpressure between this producer and this consumer?"* If not, the bottleneck must be tracked (§6) and producers throttled deliberately.
+
+### D. Organizational lens
+
+#### D.1 Conway's Law
+
+Conway, 1968:
+
+> *Any organization that designs a system will produce a design whose structure is a copy of the organization's communication structure.*
+
+Four teams produce a four-component system. Team boundaries become system boundaries. The reverse — the *Inverse Conway Maneuver* — restructures teams to *force* the architecture you want.
+
+**Why the lens matters:** *"Why is this system carved this way?"* is often not a technical question. Where two teams communicate poorly, a friction surface forms — and that surface becomes an API.
+
+### Anti-patterns when applying the lenses
+
+- **Treating a lens as dogma.** *"AP is better,"* *"push is more modern"* — these are slogans, not lens use. A lens forces a tradeoff; the answer depends on the system.
+- **Looking through a single lens.** A system can be AP under CAP but PA/EL or PC/EC under PACELC; every lens leaves a blind spot.
+- **Applying CAP outside a partition.** CAP only fires during partition. Normal-operation behavior is the EL/EC side of PACELC.
+- **Believing in exactly-once delivery.** Any system claiming it is, in fact, doing at-least-once + idempotency underneath.
+- **Using Conway's Law as a complaint.** *"The org is messy"* is an explanation, not a fix. The Inverse Conway Maneuver demands the org change too.
+
+### Summary table
+
+| Category | Lens | Question it asks |
+|---|---|---|
+| Trade-off | CAP | C or A during partition? |
+| Trade-off | PACELC | Tradeoff during partition *and* in normal operation? |
+| Trade-off | Latency vs Throughput | Which is being optimized? |
+| Trade-off | Consistency spectrum | Which level is enough? |
+| Architectural | Push vs Pull | Where is the initiative? |
+| Architectural | Sync vs Async | Is the caller waiting? |
+| Architectural | Stateful vs Stateless | Does the node hold state? |
+| Architectural | Read path vs Write path | Which direction is being optimized? |
+| Failure | Idempotency | Is retry safe? |
+| Failure | Delivery semantics | How many times is the message delivered? |
+| Failure | Failure domain / Blast radius | What goes down when this dies? |
+| Failure | Backpressure | How is producer–consumer balance maintained? |
+| Organizational | Conway's Law | Why is the system carved this way? |
+
+### What §7 covers, what §7 doesn't
+
+§7 is a *catalogue* — short, practical definitions and the question each lens forces onto the table. The *deep* treatment of each subject lives in the chapter where the mental model is most operational:
+
+- CAP, PACELC, consistency spectrum, idempotency, delivery semantics → chapter 06 (Consistency and Consensus)
+- Push vs pull, sync vs async, backpressure, delivery semantics → chapter 04 (Communication)
+- Read path vs write path, stateful vs stateless → chapter 03 (Data) and chapter 05 (Caching)
+- Failure domains, blast radius → chapter 10 (Reliability Patterns)
+- Conway's Law → chapter 09 (Deployment and Scaling)
+
+§7 carries the lens *names* so later chapters can refer back to them.
+
+### §7 recap
+
+In one sentence: **mental models are the lenses through which a system is interrogated — they do not produce answers, they force the right questions.**
+
+The discipline:
+
+> *Before describing a system, declare which lenses apply. For each lens, state which side this system is on.*
+
+A sample interview cadence: *"Under CAP it is AP; under PACELC it is PA/EL. The read path is cache→replica, the write path is primary→fan-out. Failure domain is the AZ; idempotency is via a client-supplied key. Four teams, four services — Conway."* Not one sentence — a chain of sentences, each produced by a lens.
+
+> *Lenses compose. A single lens is always half-wrong.*
+
+---
+
 ## Next
 
-- §7 — Mental models
 - §8 — SLI / SLO / SLA and error budgets
 - §9 — Engineering principles
 - §10 — Interview-ready summary
