@@ -1163,9 +1163,222 @@ The sentence to keep at the top of any estimation:
 
 ---
 
+## 6. Capacity planning ritual
+
+§5 gave the alphabet — single-node QPS ceilings, latency tiers, storage object sizes. §6 turns those into sentences: *can this system carry the next six months of traffic at SLO?*
+
+Capacity is not a single number. It is a *recurring decision* — measured against an SLO, recalculated as load grows, retriggered every quarter, every launch, every incident. This section is about that loop.
+
+### Capacity ≠ performance
+
+Performance and capacity are often confused, especially in interview answers. They are different questions:
+
+- **Performance** — how fast is *one* request? (latency, p99)
+- **Capacity** — how many concurrent requests does the system carry *while still meeting that performance*? (throughput @ SLO)
+
+A system can serve 50 ms p99 at 1k QPS and 500 ms p99 at 12k QPS. Performance did not "drop" between those points — capacity was exhausted. Beyond a system's capacity, queues form, and latency rises super-linearly (the queueing math is below, in *Headroom*).
+
+Two consequences:
+
+1. Capacity numbers without an SLO are meaningless. *"This system handles 100k QPS"* is incomplete. *"100k QPS at p99 < 200 ms"* is a capacity claim.
+2. The capacity number is bounded by the SLO, not by the hardware ceiling. Hardware can push further; the SLO refuses to follow.
+
+### The five questions
+
+Capacity planning is a process, not an arithmetic exercise. Each cycle answers five questions:
+
+| # | Question | Output |
+|---|---|---|
+| 1 | Which metrics do we watch? | Load + saturation metric set |
+| 2 | What is utilization right now? | Percentages (CPU 62%, DB pool 80%) |
+| 3 | What is the headroom target? | Ceiling (e.g., 70%) |
+| 4 | How is load growing? | Forecast curve |
+| 5 | What happens when the ceiling is crossed? | Trigger + action |
+
+The five answers — measured, written down, reviewed — *are* the capacity plan. Each subsection below covers one of them.
+
+### What we measure — load and saturation
+
+A capacity reading needs both kinds of metrics. Either alone misleads.
+
+**Load metrics — what is arriving:**
+
+- QPS, RPS
+- concurrent users, concurrent connections
+- writes/sec, reads/sec
+- messages/sec (queue producer rate)
+
+**Saturation metrics — how the system absorbs that load:**
+
+- CPU utilization
+- memory pressure (RSS, working set, page faults)
+- disk IOPS, queue depth
+- network bandwidth utilization
+- DB connection pool fullness
+- thread / file-descriptor exhaustion
+- queue depth (Kafka consumer lag, RabbitMQ backlog, worker pool depth)
+
+The two diverge in informative ways:
+
+- **Load high, saturation low** → well-provisioned. No capacity concern yet.
+- **Load low, saturation high** → bottleneck inside the system: memory leak, contention, slow downstream. Adding traffic makes it worse, not better.
+- **Load high, saturation high** → at the edge. The capacity ceiling is what you measure here.
+
+**The USE method** is the canonical frame for the saturation side, due to Brendan Gregg. For each resource (CPU, memory, disk, network, every pool), ask three questions:
+
+- **U**tilization — how busy is this resource? (% of time)
+- **S**aturation — how much extra work is queued for it?
+- **E**rrors — how often does it return errors?
+
+USE is a *checklist*, not a tool. Run it on every shared resource in the system. The first resource where U or S is high is the next capacity constraint.
+
+### Headroom — why not 100%?
+
+A natural question: if a CPU has spare cycles, why deliberately leave them empty? The answer is from queueing theory, not policy.
+
+For an M/M/1 queue (single server, Poisson arrivals), average wait time is proportional to:
+
+> **wait ∝ ρ / (1 − ρ)**, where ρ is utilization
+
+Plotted, this is not "linear with a small bend." It is a wall:
+
+| Utilization | Wait factor |
+|---|---|
+| 50% | 1× |
+| 70% | 2.3× |
+| 80% | 4× |
+| 90% | 9× |
+| 95% | 19× |
+| 99% | 99× |
+
+The cost of running 50% → 70% is small. The cost of running 90% → 95% is doubling the queue. **Headroom is not slack — it is latency insurance.**
+
+Practical headroom targets, by resource type:
+
+| Resource | Target ceiling |
+|---|---|
+| Stateless app/API CPU | 60–70% |
+| Database CPU | 50–60% |
+| Disk I/O | ~50% |
+| Network bandwidth | ~50% (microburst risk) |
+| Queue depth | should drain — sustained backlog is a saturation signal |
+
+Two reasons headroom is held below the wall, not at it:
+
+1. **Burst absorption.** Spikes (deploys, retries, partial outages, viral content) routinely add 20–30% load. The headroom catches them; the SLO holds.
+2. **Provisioning lead time.** Cloud instances arrive in seconds; bare-metal in weeks. The longer the lead time, the larger the buffer needs to be.
+
+### Forecasting — how load grows
+
+Headroom is not a static number. It is held against a *growth rate*. The planning question is: at the current trajectory, *how long until the headroom is consumed?*
+
+Four typical growth shapes:
+
+1. **Linear** — predictable B2B, signup-driven. Forecast is straightforward extrapolation.
+2. **Exponential / compounding** — viral consumer, network-effect products. Doubling time = **70 / monthly-percent-growth** months (rule of 70). 6%/month → ~12-month doubling; 15%/month → ~5-month doubling.
+3. **Seasonal + spikes** — e-commerce (Black Friday), tax software, event-driven launches. Peak/average ratio of 5–20× is common; capacity is provisioned to peak, idle the rest of the time.
+4. **S-curve** — a feature rollout that grows fast then saturates as the addressable user set fills.
+
+**Practical rule:** take the trailing 3–6 months of trend, overlay known events (campaigns, launches, feature flag rollouts), add a 20% safety margin. The forecast itself will be wrong — the discipline is to recheck and replan, not to compute one number perfectly.
+
+### Bottleneck — the first resource to fail
+
+A system runs out of one of five things first: **CPU, memory, disk I/O, network, or a downstream dependency** (database, cache, external API). USE finds it; the capacity ceiling sits there.
+
+Typical bottleneck patterns:
+
+| System | First to saturate |
+|---|---|
+| Stateless API gateway | CPU or network |
+| Read-heavy DB | CPU + cache miss → disk I/O |
+| Write-heavy DB | disk I/O (WAL fsync), or replication lag |
+| Cache layer | network bandwidth (large values), or CPU on eviction |
+| Queue consumer | downstream throughput |
+| Image / video pipeline | disk + CPU (encoding) |
+
+The discipline is: **once the bottleneck is found, capacity equals that resource's ceiling — nothing else matters.** Doubling app-tier CPU when the DB connection pool is the bottleneck adds zero capacity; the bottleneck has just moved into sharper focus. Capacity planning is, in the end, bottleneck tracking.
+
+This connects back to §3 — Amdahl says the serial fraction caps speedup, USL says contention and coherence eventually bend it down. The bottleneck is the physical embodiment of those laws inside *this* system. See [scalability-laws.md](./scalability-laws.md) for the full derivation.
+
+### Trigger and action
+
+Once a metric crosses a threshold, something must happen. The plan is written in three tiers:
+
+| Tier | Threshold | Action |
+|---|---|---|
+| **Warning** | ~70% of ceiling | dashboard signal, team awareness |
+| **Critical** | ~85% | on-call alarm, incident channel |
+| **Saturation** | ~95% | automated action: auto-scale, load shed, circuit break |
+
+Auto-scaling strategies, used singly or combined:
+
+- **Reactive** — *if CPU > 70%, add an instance.* Simple; lags warm-up time.
+- **Predictive** — scale ahead of known patterns (Netflix's evening peak, Uber's Friday-night surge).
+- **Scheduled** — *every weekday at 08:00, +N instances.* Trivial, predictable, cheap.
+
+Provisioning lead time governs the choice:
+
+| Provisioning path | Lead time |
+|---|---|
+| AWS EC2 + ALB | ~30 s |
+| Kubernetes pod (warm node) | ~5 s |
+| New node from autoscaling group | 1–3 min |
+| Bare-metal | days to weeks |
+
+The longer the lead time, the more headroom must be held; reactive auto-scaling assumes seconds-to-minutes provisioning. Bare-metal capacity is *planned*, not reacted to.
+
+### When the ritual runs
+
+Three triggers, each producing a different output:
+
+1. **Quarterly planning** — fold the latest forecast into the capacity ledger. *"Will current provisioning carry the next 90 days?"* If no, file the provisioning work.
+2. **Pre-launch / pre-event** — Black Friday, product launch, major feature rollout. Run a load test, validate headroom against expected peak.
+3. **Post-incident** — after a saturation incident. *"Why did we not see the ceiling? Which metric was missing?"* This is the most valuable trigger; it improves the ritual itself.
+
+A capacity plan that runs only at moment 1 will be surprised by moment 2 and humiliated by moment 3.
+
+### Anti-patterns
+
+The classic mistakes — common in interviews, common in production:
+
+- **"CPU is fine, so we have room."** CPU may be fine while the DB pool is exhausted. A single metric reading is not a capacity check.
+- **Planning against averages.** Peak/average can be 10×. Plan against peak with margin, not against the mean.
+- **Headroom set to 90%.** "Spare CPU is wasted CPU" reasoning. The first burst breaks the SLO; the ritual collapses.
+- **Forecast frozen in time.** A forecast written six months ago is a plan against last quarter's traffic.
+- **Single-tier auto-scale.** App tier scales, database does not — the bottleneck migrates and breaks at the seam.
+- **Synthetic load test as proof.** Real traffic has long-tail key distributions, hot keys, bursty arrival patterns. Synthetic tests miss these and overstate capacity.
+
+### What §6 covers, what §6 doesn't
+
+§6 is the *operating loop*: the questions, the cadence, the math behind headroom, the framework (USE) for finding the bottleneck. It treats capacity as a continuous engineering practice rather than a one-shot calculation.
+
+What §6 leaves to later chapters:
+
+- **Auto-scalers as products** — HPA, KEDA, AWS Auto Scaling Groups, predictive scalers — get concept cards in chapter 09 (Deployment and Scaling). §6 names the strategy types; chapter 09 covers the tools.
+- **SLI / SLO formalism + error budgets** — §8.
+- **Observability stack** (Prometheus, dashboards, alerting wiring) — chapter 11. §6 names the metrics; chapter 11 covers their plumbing.
+- **Per-storage-engine capacity tuning** (Postgres connection pooling, Redis maxmemory policies, Kafka partition sizing) — covered alongside each system in chapters 03 (Data) and 07 (Storage).
+
+### §6 recap
+
+In one sentence: **capacity is not a number; it is a recurring decision — *throughput at SLO*, measured against a forecast, bounded by a tracked bottleneck, defended with headroom whose size is dictated by queueing math and provisioning lead time.**
+
+The five questions, restated:
+
+1. What load and saturation metrics do we watch? (USE every shared resource.)
+2. Where is utilization now?
+3. What headroom does the SLO require? (Look up ρ / (1 − ρ); decide which utilization bend the SLO can survive.)
+4. How is load growing? (Linear / exponential / seasonal / S-curve, with a 20% margin.)
+5. When the ceiling is approached, what fires? (Warning → Critical → Saturation, with reactive / predictive / scheduled scaling matched to provisioning lead time.)
+
+Bind the answers to a cadence — quarterly, pre-launch, post-incident — and the result is a capacity plan that survives contact with real traffic.
+
+> *Capacity is not a number — it is throughput at SLO, replanned every cycle.*
+
+---
+
 ## Next
 
-- §6 — Capacity planning ritual
 - §7 — Mental models
 - §8 — SLI / SLO / SLA and error budgets
 - §9 — Engineering principles
