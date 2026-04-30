@@ -1675,9 +1675,85 @@ Deeper material — multi-window burn-rate alerting, SLO ladders by service tier
 
 ---
 
+## 9. Engineering principles
+
+A small set of well-worn rules that earn their place not by being clever but by being repeatedly *correct under pressure*. They rarely show up as direct interview questions; they show up as the **discipline behind a tasteful design answer** — the reason one diagram is judged "senior" and another "over-engineered."
+
+Each principle is a *bias*, not a law. Together they pull a design toward simplicity, reliability, and reversibility.
+
+### 9.1 YAGNI — *You Ain't Gonna Need It*
+
+Build for the requirements you know, not for the ones you imagine. Speculative features carry the same maintenance cost as real ones, with none of the value.
+
+**Where it bites:** the "extensible plugin system" that nobody plugs in to; the abstract base class with one concrete subclass forever.
+
+### 9.2 KISS — *Keep It Simple*
+
+Complexity is not free; every abstraction is a maintenance debt and a learning tax. Solve the simplest version first; let the second version emerge from real friction, not anticipated friction.
+
+**Where it bites:** premature microservice decomposition; three-layer queue chains where one queue would have done.
+
+### 9.3 End-to-end principle
+
+Saltzer, Reed, and Clark (1984): reliability checks belong at the **endpoints**, not in the intermediate layers. Networks, queues, and middleware do their best; the truth is verified at the edges.
+
+**Where it bites:** trusting that "the queue is reliable" instead of having the consumer verify and ack. Trusting TCP for application-level integrity. The sender writes a record; the receiver re-checks the checksum.
+
+### 9.4 Principle of least surprise
+
+A system's behavior should be predictable from its name and shape, not from its documentation. If a function called `getUser` writes to the database, somebody is going to be surprised — usually at 3 AM.
+
+**Where it bites:** APIs whose verbs lie (`POST /users/refresh` that deletes accounts); side effects hidden behind pure-looking names; defaults that differ between dev and prod.
+
+### 9.5 Fail fast, fail loudly
+
+A failure that is visible at the second it happens costs minutes. A failure that is silenced costs days, and surfaces in unrelated alerts. Errors should propagate, log, and alert — not be swallowed by a `catch` that returns zero.
+
+**Where it bites:** catch-all blocks that hide schema mismatches; retry loops that mask a downstream outage; default values returned in place of errors. The cost compounds: every silent failure is a future incident with no breadcrumbs.
+
+### 9.6 Make the right thing easy, the wrong thing hard
+
+Defaults should land in the safe place. The risky path should require explicit opt-in — a flag, a comment, a code review.
+
+**Where it bites:** raw SQL string concatenation easier than a parameterized query (SQL injection); a `delete()` API with no soft-delete option; a config that ships with `debug: true`. If safety requires discipline, it eventually fails; if safety is the default, the principle scales.
+
+### 9.7 Boring technology — Dan McKinley's "innovation tokens"
+
+A team has a fixed budget of *innovation tokens* per year. Spend them on the parts of the system where novelty is worth it; for everything else, choose the boring, well-understood option. *Postgres + Redis + a queue* covers more designs than any new database does.
+
+**Where it bites:** adopting three new datastores at once and burning the on-call team; choosing a fashionable framework whose Stack Overflow page is empty; trading hiring leverage for technical novelty.
+
+### 9.8 Reversibility — one-way vs two-way doors
+
+Bezos (referenced in §4 Maintainability): decisions split into two-way doors (cheap to reverse — try, observe, adjust) and one-way doors (cheap to make, expensive to undo). Make two-way decisions *fast*; make one-way decisions *slow* and with deliberation.
+
+**Where it bites:** treating a public API contract as a two-way door (it isn't — once shipped, customers depend on it); treating a feature flag as a one-way door (it isn't — flip it, observe, flip back).
+
+### Anti-patterns when applying principles
+
+- **Treating a principle as a law.** *"YAGNI says don't add it"* is not an argument; the question is whether the requirement is real *now*. Principles are biases under uncertainty.
+- **Stacking principles to win an argument.** Selecting the principle that supports a preferred answer is post-hoc reasoning; pick the design first, then check whether the principles applied honestly.
+- **Quoting the slogan without the *why*.** *"KISS"* is not a design review comment. *"This is two layers of indirection for one caller — KISS"* is.
+
+### §9 recap
+
+| Principle | Bias |
+|---|---|
+| YAGNI | Build the known, not the imagined |
+| KISS | Simple first; complexity earns its place |
+| End-to-end | Verify at the edges, not in the middle |
+| Least surprise | Behavior matches the name |
+| Fail fast, fail loudly | Visibility beats silence |
+| Right thing easy | Defaults are safe; risk is opt-in |
+| Boring technology | Spend novelty where it pays |
+| Reversibility | Cheap to undo → fast; expensive → slow |
+
+> *Principles are not laws. They are the gravity a good design falls toward when nobody is watching.*
+
+---
+
 ## Next
 
-- §9 — Engineering principles
 - §10 — Interview-ready summary
 
 Sections are added as they are studied. Some will graduate into standalone supplementary files in this folder.
