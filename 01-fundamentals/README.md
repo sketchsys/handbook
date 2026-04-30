@@ -1752,8 +1752,113 @@ Bezos (referenced in §4 Maintainability): decisions split into two-way doors (c
 
 ---
 
-## Next
+## 10. Interview-ready summary
 
-- §10 — Interview-ready summary
+The condensed form of this chapter — what to keep loaded when walking into a system design interview. Each block points back to the section that earns it.
 
-Sections are added as they are studied. Some will graduate into standalone supplementary files in this folder.
+### The opening 30 seconds — clarification
+
+Before drawing anything, ask. The full playbook lives in [`how-to-approach-a-design-question.md`](../00-overview/how-to-approach-a-design-question.md); the minimum:
+
+- **Functional**: what user actions, what data, what is in/out of scope?
+- **Non-functional**: scale (DAU, QPS, payload size), latency target, consistency tolerance, durability, availability target?
+- **Constraints**: existing stack, team size, deadline, regulatory boundaries?
+
+The candidate who *jumps to the diagram* has already lost half the marks.
+
+### The quality axes — one sentence each (§1–§4)
+
+| Axis | Sentence |
+|---|---|
+| **Reliability** | *Continues to work correctly even when faults occur* — fault ≠ failure; redundancy + isolation + recovery. |
+| **Scalability** | *Maintains performance as load grows* — defined relative to a load parameter and an SLO; horizontal beats vertical above a threshold. |
+| **Maintainability** | *Stays cheap to operate and evolve over time* — operability + simplicity + evolvability. |
+| **Security** | Treated as its own axis (chapter 12), not a subset of reliability. |
+| **Cost** | A cross-cutting constraint, not a chapter — every other axis is bounded by it. |
+
+### The numbers — bare-minimum cheat sheet (§5)
+
+| Operation | Order |
+|---|---|
+| L1 cache | ~1 ns |
+| Main memory | ~100 ns |
+| SSD random read | ~100 µs |
+| Cross-DC round-trip | ~10 ms |
+| Cross-region round-trip | ~100 ms |
+
+| System (single node) | Throughput |
+|---|---|
+| HTTP server | ~10k QPS |
+| Postgres reads | ~50k QPS |
+| Redis | ~100k QPS |
+| Kafka per partition | ~100 MB/s |
+
+The two memorable conversions: 1 year ≈ π × 10⁷ s; 2¹⁰ ≈ 10³. Full reference in [back-of-envelope-numbers.md](./back-of-envelope-numbers.md).
+
+### The capacity sentence (§6)
+
+> *Capacity is throughput at SLO — measured against a forecast, bounded by a tracked bottleneck, defended with headroom whose size comes from queueing math (ρ / (1−ρ)) and provisioning lead time.*
+
+### The reliability contract (§8)
+
+> *SLI is a number, SLO is an internal target, SLA is an external contract with a penalty. SLO is always stricter than SLA. Error budget = 1 − SLO; the budget governs deploy velocity — burn fast, freeze; burn slow, ship.*
+
+### The lens checklist (§7)
+
+The 13 questions to walk through, in order:
+
+| # | Lens | Question |
+|---|---|---|
+| 1 | CAP | C or A during partition? |
+| 2 | PACELC | Tradeoff during partition *and* in normal operation? |
+| 3 | Latency vs Throughput | Which is being optimized? |
+| 4 | Consistency spectrum | Which level is enough? |
+| 5 | Push vs Pull | Where is the initiative? |
+| 6 | Sync vs Async | Is the caller waiting? |
+| 7 | Stateful vs Stateless | Does the node hold state? |
+| 8 | Read path vs Write path | Which direction is being optimized? |
+| 9 | Idempotency | Is retry safe? |
+| 10 | Delivery semantics | How many times is the message delivered? |
+| 11 | Failure domain / Blast radius | What goes down when this dies? |
+| 12 | Backpressure | How is producer–consumer balance maintained? |
+| 13 | Conway's Law | Why is the system carved this way? |
+
+A senior answer makes 4–6 of these lenses *explicit* in the design.
+
+### The principles — invoked under pressure (§9)
+
+Build the known (YAGNI). Keep it simple (KISS). Verify at the edges (end-to-end). Match name to behavior (least surprise). Fail loudly. Make safe the default. Spend novelty sparingly (boring tech). Match decision speed to reversibility.
+
+### A complete cadence — what an answer sounds like
+
+> *"Functional scope is X; non-functional is Y RPS, p99 < Z ms, durability D, availability A. At Y RPS, the back-of-envelope says one Postgres won't carry it — so I shard. The read path is cache → replica → primary; the write path is primary → fan-out. Under PACELC this is PA/EL — Cassandra-class. Failure domain is the AZ; idempotency via client-supplied key. SLO is 99.9%, SLA is 99.5% — error budget governs deploys. Bottleneck I expect is the write path under hot keys; mitigation is sharding by user_id with consistent hashing."*
+
+That sentence is built from the chapter's pieces — clarification, numbers, lenses, capacity, contract — assembled as one chain of reasoning.
+
+### What *not* to do
+
+- Don't recite definitions. *"CAP says..."* is filler; *"under CAP this system is AP because..."* is signal.
+- Don't list everything. A senior answer prunes — the unsaid options reveal taste.
+- Don't apologize for assumptions. State them, move on, revisit if asked.
+- Don't draw before asking. The diagram is the *output*, not the opening.
+
+### Closing — what fundamentals delivers
+
+This chapter is the **vocabulary layer**: the axes that define "good," the numbers that ground intuition, the loop that operates capacity, the lenses that ask the right questions, the contract that quantifies reliability, the principles that bend a design toward taste.
+
+Chapters 02–12 apply this vocabulary to **specific concrete systems** — networking, data, communication, caching, consistency, storage, search, deployment, reliability patterns, observability, security. Each new tool that lands in those chapters is judged against the same axes, the same lenses, the same principles.
+
+> *The fundamentals are the lens; everything that follows is a thing seen through it.*
+
+---
+
+## Closing the chapter
+
+Chapter 01 covers the vocabulary of system design: quality axes, capacity, mental models, reliability contracts, principles. The remaining chapters apply this vocabulary to specific subsystems and patterns. Cross-references back to §1–§10 should be expected throughout the rest of the handbook.
+
+Supplementary files in this folder:
+
+- [`availability-math.md`](./availability-math.md) — series/parallel availability calculations
+- [`redundancy-patterns.md`](./redundancy-patterns.md) — active-active, active-passive, N+1, N+M
+- [`scalability-laws.md`](./scalability-laws.md) — Amdahl, Gustafson, USL
+- [`back-of-envelope-numbers.md`](./back-of-envelope-numbers.md) — full latency/throughput/storage lookup tables
