@@ -1608,9 +1608,75 @@ A sample interview cadence: *"Under CAP it is AP; under PACELC it is PA/EL. The 
 
 ---
 
+## 8. SLI, SLO, SLA, and error budgets
+
+These three terms are the most-confused trio in interview answers. Once the layering is clear, the rest follows from arithmetic.
+
+### Three terms, three layers
+
+- **SLI** *(Service Level Indicator)* — a **measurement**. A number. *"p99 latency = 187 ms"*, *"successful requests / total = 0.9994"*
+- **SLO** *(Service Level Objective)* — an **internal target**. *"p99 < 200 ms, 99.9% of the time, over a 28-day rolling window"*
+- **SLA** *(Service Level Agreement)* — an **external contract**, with a financial penalty. *"If monthly availability drops below 99.5%, customer receives a 25% credit"*
+
+The layering is **SLI ⊂ SLO ⊂ SLA**: SLI is the raw number; SLO is the target the team holds itself to; SLA is what is promised to a customer. SLO is always *stricter* than SLA — typical pattern: SLA promises 99.5%, SLO targets 99.9%, leaving margin to repair before the contract is breached.
+
+### Choosing a good SLI
+
+A useful SLI:
+
+- Measures the **user journey**, not the resource. CPU utilization is not an SLI; *"successful logins / login attempts"* is.
+- Is a **proportion or rate**, not a raw count. Comparable across volumes.
+- Is bound to a **window** (28-day rolling is standard).
+
+Google SRE's **Four Golden Signals** are the canonical starting set: **latency, traffic, errors, saturation**. Most SLIs are formal expressions of one of these.
+
+### The nines table
+
+The cost of each additional 9 was already shown in §1; SLO targets sit on this ladder:
+
+| SLO | Monthly downtime | Yearly |
+|---|---|---|
+| 99% | 7.2 h | 3.65 d |
+| 99.9% | 43.2 min | 8.76 h |
+| 99.99% | 4.32 min | 52.6 min |
+| 99.999% | 26 s | 5.26 min |
+
+Each 9 costs roughly 10× more in engineering, infrastructure, and architectural complexity (see §1). The SLO is the *budget statement*: how much reliability is the team willing to fund?
+
+### Error budget — fuel for deploy velocity
+
+**Error budget = 1 − SLO.** A 99.9% monthly SLO yields a 0.1% budget = 43 minutes/month of tolerated unavailability.
+
+The insight from Google SRE: **a 100% reliability target is irrational** — it is expensive, unnecessary, and freezes feature work. A defined error budget turns reliability into **fuel for deployment**:
+
+- **Budget burning fast** (e.g., 30 minutes already consumed by mid-month) → slow deploys, bug fixes only, reduce risk
+- **Budget under-consumed** → ship features, run risky experiments, deploy more frequently
+
+This converts the classic SRE-vs-Dev tension (*"don't break it"* vs *"ship faster"*) into a **numerical contract** instead of a political one.
+
+### Interview cadence
+
+The sentence that earns the marks:
+
+> *"SLI is a number, SLO is an internal target, SLA is an external contract with a penalty. SLO is always stricter than SLA, leaving repair margin. Error budget = 1 − SLO; the budget governs deploy velocity — burn fast, freeze; burn slow, ship."*
+
+Deeper material — multi-window burn-rate alerting, SLO ladders by service tier, the operational details — lives in chapter 11 (Observability).
+
+### §8 recap
+
+| Term | Owner | Output |
+|---|---|---|
+| SLI | Engineering | A number |
+| SLO | Engineering + Product | Internal target; deploy discipline |
+| SLA | Legal + Sales | Customer contract; financial penalty |
+| Error budget | SRE + Dev jointly | 1 − SLO; the velocity governor |
+
+> *Reliability is not a number; it is a contract — with whom, for how much, under what penalty.*
+
+---
+
 ## Next
 
-- §8 — SLI / SLO / SLA and error budgets
 - §9 — Engineering principles
 - §10 — Interview-ready summary
 
